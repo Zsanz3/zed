@@ -1,4 +1,4 @@
-use super::{SerializedAxis, SerializedWindowBounds, UNAVAILABLE_SESSION_WORKSPACE_RETENTION};
+use super::{SerializedAxis, SerializedWindowBounds};
 use crate::{
     Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId, item::ItemHandle,
     multi_workspace::SerializedProjectGroupState, path_list::PathList,
@@ -36,6 +36,8 @@ pub(crate) enum RemoteConnectionKind {
     Ssh,
     Wsl,
     Docker,
+    #[cfg(any(test, feature = "test-support"))]
+    Mock,
 }
 
 #[derive(Debug, PartialEq, Clone, serde::Serialize, serde::Deserialize)]
@@ -150,6 +152,27 @@ pub struct MultiWorkspaceState {
     pub sidebar_state: Option<String>,
 }
 
+impl MultiWorkspaceState {
+    pub(crate) fn preserving_restored(&self, live: MultiWorkspaceState) -> MultiWorkspaceState {
+        let mut project_groups = self.project_groups.clone();
+        for group in live.project_groups {
+            let key = ProjectGroupKey::from(group.clone());
+            if !project_groups
+                .iter()
+                .any(|restored| ProjectGroupKey::from(restored.clone()) == key)
+            {
+                project_groups.push(group);
+            }
+        }
+        MultiWorkspaceState {
+            active_workspace_id: live.active_workspace_id,
+            sidebar_open: self.sidebar_open || live.sidebar_open,
+            project_groups,
+            sidebar_state: self.sidebar_state.clone().or(live.sidebar_state),
+        }
+    }
+}
+
 /// The serialized state of a single MultiWorkspace window from a previous session:
 /// the active workspace to restore plus window-level state (project group keys,
 /// sidebar).
@@ -191,6 +214,29 @@ pub(crate) struct UnserializedRootFiles {
     pub(crate) active: Option<PathBuf>,
 }
 
+pub(crate) struct Lenient<T>(pub(crate) Option<T>);
+
+impl<T: StaticColumnCount> StaticColumnCount for Lenient<T> {
+    fn column_count() -> usize {
+        T::column_count()
+    }
+}
+
+impl<T: Column + StaticColumnCount> Column for Lenient<T> {
+    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
+        let next_index = start_index + T::column_count() as i32;
+        match T::column(statement, start_index) {
+            Ok((value, _)) => Ok((Self(Some(value)), next_index)),
+            Err(error) => {
+                log::warn!(
+                    "Ignoring an undecodable database value at column {start_index}: {error:#}"
+                );
+                Ok((Self(None), next_index))
+            }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
 pub struct DockStructure {
     pub left: DockData,
@@ -204,6 +250,8 @@ impl RemoteConnectionKind {
             RemoteConnectionKind::Ssh => "ssh",
             RemoteConnectionKind::Wsl => "wsl",
             RemoteConnectionKind::Docker => "docker",
+            #[cfg(any(test, feature = "test-support"))]
+            RemoteConnectionKind::Mock => "mock",
         }
     }
 
@@ -212,6 +260,8 @@ impl RemoteConnectionKind {
             "ssh" => Some(Self::Ssh),
             "wsl" => Some(Self::Wsl),
             "docker" => Some(Self::Docker),
+            #[cfg(any(test, feature = "test-support"))]
+            "mock" => Some(Self::Mock),
             _ => None,
         }
     }
@@ -251,12 +301,12 @@ pub struct DockData {
 impl Column for DockData {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let (visible, next_index) = Option::<bool>::column(statement, start_index)?;
-        let (active_panel, next_index) = Option::<String>::column(statement, next_index)?;
+        let (active_panel, next_index) = Lenient::<Option<String>>::column(statement, next_index)?;
         let (zoom, next_index) = Option::<bool>::column(statement, next_index)?;
         Ok((
             DockData {
                 visible: visible.unwrap_or(false),
-                active_panel,
+                active_panel: active_panel.0.flatten(),
                 zoom: zoom.unwrap_or(false),
             },
             next_index,
@@ -295,19 +345,10 @@ impl Default for SerializedPaneGroup {
 
 impl SerializedPaneGroup {
     pub(crate) fn restorable_panes(&self) -> Vec<&SerializedPane> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::restorable_panes)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => {
-                if serialized_pane.children.is_empty() {
-                    Vec::new()
-                } else {
-                    vec![serialized_pane]
-                }
-            }
-        }
+        self.panes()
+            .into_iter()
+            .filter(|pane| !pane.children.is_empty())
+            .collect()
     }
 
     pub(crate) fn build_restored_member(
@@ -341,51 +382,17 @@ impl SerializedPaneGroup {
                     ))),
                 }
             }
-            SerializedPaneGroup::Pane(serialized_pane) => {
-                if serialized_pane.children.is_empty() {
-                    None
-                } else {
-                    Some(Member::Pane(pane_for_leaf(serialized_pane)))
-                }
-            }
-        }
-    }
-
-    pub(crate) fn item_count(&self) -> usize {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => {
-                children.iter().map(SerializedPaneGroup::item_count).sum()
-            }
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.children.len(),
+            SerializedPaneGroup::Pane(serialized_pane) => (!serialized_pane.children.is_empty())
+                .then(|| Member::Pane(pane_for_leaf(serialized_pane))),
         }
     }
 
     pub(crate) fn item_keys(&self) -> HashSet<(Arc<str>, ItemId)> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::item_keys)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane
-                .children
-                .iter()
-                .map(SerializedItem::key)
-                .collect(),
-        }
+        self.items().map(SerializedItem::key).collect()
     }
 
     pub(crate) fn item_ids(&self) -> Vec<ItemId> {
-        match self {
-            SerializedPaneGroup::Group { children, .. } => children
-                .iter()
-                .flat_map(SerializedPaneGroup::item_ids)
-                .collect(),
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane
-                .children
-                .iter()
-                .map(|item| item.item_id)
-                .collect(),
-        }
+        self.items().map(|item| item.item_id).collect()
     }
 
     pub(crate) fn append_unrestored_items(&mut self, live_items: Vec<SerializedItem>) {
@@ -397,8 +404,9 @@ impl SerializedPaneGroup {
         if items.is_empty() {
             return;
         }
-        let has_active_pane = self.has_active_pane();
-        let Some(pane) = self.first_pane_mut(has_active_pane) else {
+        let panes = self.panes_mut();
+        let target_index = panes.iter().position(|pane| pane.active).unwrap_or(0);
+        let Some(pane) = panes.into_iter().nth(target_index) else {
             return;
         };
         if items.iter().any(|item| item.active) {
@@ -409,23 +417,27 @@ impl SerializedPaneGroup {
         pane.children.extend(items);
     }
 
-    fn has_active_pane(&self) -> bool {
+    fn items(&self) -> impl Iterator<Item = &SerializedItem> {
+        self.panes().into_iter().flat_map(|pane| &pane.children)
+    }
+
+    fn panes(&self) -> Vec<&SerializedPane> {
         match self {
-            SerializedPaneGroup::Group { children, .. } => {
-                children.iter().any(SerializedPaneGroup::has_active_pane)
-            }
-            SerializedPaneGroup::Pane(serialized_pane) => serialized_pane.active,
+            SerializedPaneGroup::Group { children, .. } => children
+                .iter()
+                .flat_map(SerializedPaneGroup::panes)
+                .collect(),
+            SerializedPaneGroup::Pane(serialized_pane) => vec![serialized_pane],
         }
     }
 
-    fn first_pane_mut(&mut self, active_only: bool) -> Option<&mut SerializedPane> {
+    fn panes_mut(&mut self) -> Vec<&mut SerializedPane> {
         match self {
             SerializedPaneGroup::Group { children, .. } => children
                 .iter_mut()
-                .find_map(|child| child.first_pane_mut(active_only)),
-            SerializedPaneGroup::Pane(serialized_pane) => {
-                (!active_only || serialized_pane.active).then_some(serialized_pane)
-            }
+                .flat_map(SerializedPaneGroup::panes_mut)
+                .collect(),
+            SerializedPaneGroup::Pane(serialized_pane) => vec![serialized_pane],
         }
     }
 }
@@ -483,26 +495,14 @@ impl SerializedPane {
         let mut restored_pinned_count = 0;
         let mut active_item = None;
         let mut preview_item = None;
+        let mut adopted_items = Vec::new();
         let mut placed_items = Vec::with_capacity(items.len());
         for (child_index, (serialized_item, item)) in self.children.iter().zip(items).enumerate() {
             let Some(item) = item else {
                 placed_items.push(None);
                 continue;
             };
-            let (item, inserted) = if pane_had_items {
-                pane.insert_restored_item(item.boxed_clone(), next_index, cx)
-            } else {
-                pane.add_item_inner(
-                    item.boxed_clone(),
-                    false,
-                    false,
-                    true,
-                    Some(next_index),
-                    window,
-                    cx,
-                );
-                (item.boxed_clone(), true)
-            };
+            let (item, inserted) = pane.insert_restored_item(item.boxed_clone(), next_index, cx);
             if inserted {
                 next_index += 1;
                 if child_index < self.pinned_count {
@@ -511,6 +511,12 @@ impl SerializedPane {
                 if serialized_item.preview {
                     preview_item = Some(item.item_id());
                 }
+            } else {
+                adopted_items.push((
+                    item.item_id(),
+                    child_index < self.pinned_count,
+                    serialized_item.preview,
+                ));
             }
             if serialized_item.active {
                 active_item = Some(item.boxed_clone());
@@ -522,6 +528,7 @@ impl SerializedPane {
             && let Some(index) = active_item
                 .as_ref()
                 .and_then(|item| pane.index_for_item(item.as_ref()))
+                .or_else(|| pane.items_len().checked_sub(1))
         {
             pane.activate_item(index, false, false, window, cx);
         }
@@ -531,36 +538,13 @@ impl SerializedPane {
             pane.set_preview_item_id(Some(preview_item), cx);
         }
         pane.set_pinned_count((first_index + restored_pinned_count).min(pane.items_len()));
+        for (item_id, pinned, preview) in adopted_items {
+            pane.adopt_tab_state(item_id, pinned, preview, cx);
+        }
+        if !pane_had_items {
+            pane.enforce_tab_limit_keeping_active(window, cx);
+        }
         placed_items
-    }
-
-    pub(crate) fn unrestored(
-        &self,
-        items: &[Option<Box<dyn ItemHandle>>],
-        now: i64,
-    ) -> Option<SerializedPane> {
-        let mut pinned_count = 0;
-        let children = self
-            .children
-            .iter()
-            .zip(items)
-            .enumerate()
-            .filter(|(_, (_, item))| item.is_none())
-            .filter_map(|(index, (serialized_item, _))| {
-                let unrestored_since = serialized_item.unrestored_since.unwrap_or(now);
-                if now - unrestored_since >= UNAVAILABLE_SESSION_WORKSPACE_RETENTION.num_seconds() {
-                    return None;
-                }
-                if index < self.pinned_count {
-                    pinned_count += 1;
-                }
-                Some(SerializedItem {
-                    unrestored_since: Some(unrestored_since),
-                    ..serialized_item.clone()
-                })
-            })
-            .collect::<Vec<_>>();
-        (!children.is_empty()).then(|| SerializedPane::new(children, self.active, pinned_count))
     }
 
     pub(crate) fn merge_pending(&mut self, pending: &SerializedPane) {
@@ -605,7 +589,6 @@ pub struct SerializedItem {
     pub item_id: ItemId,
     pub active: bool,
     pub preview: bool,
-    pub(crate) unrestored_since: Option<i64>,
 }
 
 impl SerializedItem {
@@ -615,7 +598,6 @@ impl SerializedItem {
             item_id,
             active,
             preview,
-            unrestored_since: None,
         }
     }
 
@@ -632,14 +614,13 @@ impl Default for SerializedItem {
             item_id: 100000,
             active: false,
             preview: false,
-            unrestored_since: None,
         }
     }
 }
 
 impl StaticColumnCount for SerializedItem {
     fn column_count() -> usize {
-        5
+        4
     }
 }
 impl Bind for &SerializedItem {
@@ -647,8 +628,7 @@ impl Bind for &SerializedItem {
         let next_index = statement.bind(&self.kind, start_index)?;
         let next_index = statement.bind(&self.item_id, next_index)?;
         let next_index = statement.bind(&self.active, next_index)?;
-        let next_index = statement.bind(&self.preview, next_index)?;
-        statement.bind(&self.unrestored_since, next_index)
+        statement.bind(&self.preview, next_index)
     }
 }
 
@@ -658,14 +638,12 @@ impl Column for SerializedItem {
         let (item_id, next_index) = ItemId::column(statement, next_index)?;
         let (active, next_index) = bool::column(statement, next_index)?;
         let (preview, next_index) = bool::column(statement, next_index)?;
-        let (unrestored_since, next_index) = Option::<i64>::column(statement, next_index)?;
         Ok((
             SerializedItem {
                 kind,
                 item_id,
                 active,
                 preview,
-                unrestored_since,
             },
             next_index,
         ))

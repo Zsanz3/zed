@@ -49,6 +49,7 @@ use project::{
     CompletionSource, LanguageServerLogType, ProgressToken, Project, ProjectPath,
     agent_server_store::AgentServerCommand,
     buffer_store::BufferStoreEvent,
+    debugger::breakpoint_store::{BreakpointState, SourceBreakpoint},
     image_store,
     lsp_store::log_store::{
         GlobalLogStore, LanguageServerKind, LanguageServerLogKey, LogKind, LogStore,
@@ -243,6 +244,77 @@ async fn test_basic_remote_editing(cx: &mut TestAppContext, server_cx: &mut Test
             "fn one() -> usize { 100 }"
         );
     });
+}
+
+#[gpui::test]
+async fn test_saved_breakpoints_restore_into_a_fresh_remote_server(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let fs = FakeFs::new(server_cx.executor());
+    fs.insert_tree(
+        path!("/code/project"),
+        json!({ "a.txt": "one\ntwo\nthree" }),
+    )
+    .await;
+    let (project, headless) = init_test(&fs, cx, server_cx).await;
+    project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/code/project"), true, cx)
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    let path = Arc::<Path>::from(Path::new(path!("/code/project/a.txt")));
+    let saved = SourceBreakpoint {
+        row: 1,
+        path: path.clone(),
+        message: Some(Arc::from("logged")),
+        condition: None,
+        hit_condition: None,
+        state: BreakpointState::Disabled,
+    };
+
+    project
+        .update(cx, |project, cx| {
+            project
+                .breakpoint_store()
+                .update(cx, |breakpoint_store, cx| {
+                    breakpoint_store.with_serialized_breakpoints(
+                        collections::BTreeMap::from_iter([(
+                            path.clone(),
+                            Vec::from([saved.clone()]),
+                        )]),
+                        cx,
+                    )
+                })
+        })
+        .await
+        .unwrap();
+    cx.run_until_parked();
+    server_cx.run_until_parked();
+    cx.run_until_parked();
+
+    let breakpoints = |store: &Entity<project::debugger::breakpoint_store::BreakpointStore>,
+                       cx: &mut TestAppContext| {
+        store.read_with(cx, |store, cx| {
+            store
+                .all_source_breakpoints(cx)
+                .into_values()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+    };
+    let server_store =
+        headless.read_with(server_cx, |headless, _| headless.breakpoint_store.clone());
+    let client_store = project.read_with(cx, |project, _| project.breakpoint_store());
+    assert_eq!(
+        (
+            breakpoints(&server_store, server_cx),
+            breakpoints(&client_store, cx)
+        ),
+        (Vec::from([saved.clone()]), Vec::from([saved]))
+    );
 }
 
 #[gpui::test]

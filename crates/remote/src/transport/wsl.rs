@@ -2,7 +2,10 @@ use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
     command::{RemoteCommand, home_stdio_launcher_command},
     remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
-    transport::{HOME_DIR_ARGS, HOME_DIR_PROGRAM, parse_home_dir, parse_platform, parse_shell},
+    transport::{
+        HOME_DIR_ARGS, HOME_DIR_PROGRAM, ProxyProcesses, parse_home_dir, parse_platform,
+        parse_shell,
+    },
 };
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -51,6 +54,7 @@ impl From<settings_content::WslConnection> for WslConnectionOptions {
 
 #[derive(Debug)]
 pub(crate) struct WslRemoteConnection {
+    proxies: ProxyProcesses,
     remote_binary_path: Option<Arc<RelPath>>,
     platform: RemotePlatform,
     os_version: Option<String>,
@@ -77,6 +81,7 @@ impl WslRemoteConnection {
             cx.update(|cx| (ReleaseChannel::global(cx), AppVersion::global(cx)));
 
         let mut this = Self {
+            proxies: ProxyProcesses::default(),
             connection_options,
             remote_binary_path: None,
             platform: RemotePlatform {
@@ -255,14 +260,13 @@ impl WslRemoteConnection {
         )
         .await?
         {
-            let tmp_path = paths::remote_server_dir_relative().join(
-                &RelPath::from_unix_str(&format!(
-                    "download-{}-{}",
-                    super::staging_file_suffix(),
+            let tmp_path = super::staging_file_path(
+                &binary_name,
+                &format!(
+                    "-{}",
                     remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
-            );
+                ),
+            )?;
             self.upload_file(&remote_server_path, &tmp_path, delegate, cx)
                 .await?;
             self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
@@ -283,12 +287,7 @@ impl WslRemoteConnection {
             .download_server_binary_locally(self.platform, release_channel, wanted_version, cx)
             .await?;
 
-        let tmp_path = format!(
-            "{}.{}.gz",
-            dst_path.display(PathStyle::Unix),
-            super::staging_file_suffix()
-        );
-        let tmp_path = RelPath::from_unix_str(&tmp_path).unwrap();
+        let tmp_path = super::staging_file_path(&binary_name, ".gz")?;
 
         self.upload_file(&src_path, &tmp_path, delegate, cx).await?;
         self.extract_and_install(&tmp_path, &dst_path, delegate, cx)
@@ -476,13 +475,7 @@ impl RemoteConnection for WslRemoteConnection {
         }
 
         proxy_args.push(remote_binary_path.display(PathStyle::Unix).into_owned());
-        proxy_args.push("proxy".to_owned());
-        proxy_args.push("--identifier".to_owned());
-        proxy_args.push(unique_identifier);
-
-        if reconnect {
-            proxy_args.push("--reconnect".to_owned());
-        }
+        proxy_args.extend(super::proxy_arguments(unique_identifier, reconnect));
 
         let proxy_process =
             match wsl_command_impl(&self.connection_options, "env", &proxy_args, true)
@@ -497,7 +490,7 @@ impl RemoteConnection for WslRemoteConnection {
                 }
             };
 
-        super::handle_rpc_messages_over_child_process_stdio(
+        self.proxies.run(
             proxy_process,
             incoming_tx,
             outgoing_rx,
@@ -538,11 +531,12 @@ impl RemoteConnection for WslRemoteConnection {
     }
 
     async fn kill(&self) -> Result<()> {
+        self.proxies.kill();
         Ok(())
     }
 
     fn has_been_killed(&self) -> bool {
-        false
+        self.proxies.has_been_killed()
     }
 
     fn shares_network_interface(&self) -> bool {
@@ -829,6 +823,7 @@ mod tests {
     #[test]
     fn test_build_stdio_command() -> Result<()> {
         let mut connection = WslRemoteConnection {
+            proxies: ProxyProcesses::default(),
             remote_binary_path: None,
             platform: RemotePlatform {
                 os: RemoteOs::Linux,

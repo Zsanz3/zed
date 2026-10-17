@@ -1466,6 +1466,7 @@ struct FakeFsState {
     job_event_subscribers: Arc<Mutex<Vec<JobEventSender>>>,
     trash: Mutex<SlotMap<TrashId, (TrashedEntry, FakeFsEntry)>>,
     remove_dir_errors: std::collections::HashMap<PathBuf, String>,
+    path_errors: std::collections::HashMap<PathBuf, io::ErrorKind>,
     case_sensitive: bool,
 }
 
@@ -1861,6 +1862,7 @@ impl FakeFs {
             job_event_subscribers: Arc::new(Mutex::new(Vec::new())),
             trash: Mutex::new(SlotMap::with_key()),
             remove_dir_errors: Default::default(),
+            path_errors: Default::default(),
             case_sensitive: true,
         }));
         let native_watcher = fs_watcher::OsWatcher::with_backend(
@@ -2679,6 +2681,15 @@ impl FakeFs {
             .remove(&Self::remove_dir_error_key(path.as_ref()));
     }
 
+    pub fn set_path_error(&self, path: impl AsRef<Path>, kind: Option<io::ErrorKind>) {
+        let key = Self::remove_dir_error_key(path.as_ref());
+        let mut state = self.state.lock();
+        match kind {
+            Some(kind) => state.path_errors.insert(key, kind),
+            None => state.path_errors.remove(&key),
+        };
+    }
+
     /// Entry resolution in `try_entry` ignores drive prefixes, so the error
     /// injection map must too.
     /// Otherwise, on Windows, a key like `C:\workspace\dir` would never match a
@@ -3313,10 +3324,16 @@ impl Fs for FakeFs {
         let path = normalize_path(path);
         self.simulate_random_delay().await;
         let state = self.state.lock();
-        let canonical_path = state
-            .canonicalize(&path, true)
-            .with_context(|| format!("path does not exist: {path:?}"))?;
-        Ok(canonical_path)
+        if let Some(kind) = state.path_errors.get(&Self::remove_dir_error_key(&path)) {
+            return Err(io::Error::new(*kind, format!("cannot canonicalize {path:?}")).into());
+        }
+        state.canonicalize(&path, true).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("path does not exist: {path:?}"),
+            )
+            .into()
+        })
     }
 
     async fn is_file(&self, path: &Path) -> bool {
@@ -3341,6 +3358,9 @@ impl Fs for FakeFs {
         let path = normalize_path(path);
         let mut state = self.state.lock();
         state.metadata_call_count += 1;
+        if let Some(kind) = state.path_errors.get(&Self::remove_dir_error_key(&path)) {
+            return Err(io::Error::new(*kind, format!("cannot read metadata of {path:?}")).into());
+        }
         if let Some((mut entry, _)) = state.try_entry(&path, false) {
             let is_symlink = entry.is_symlink();
             if is_symlink {

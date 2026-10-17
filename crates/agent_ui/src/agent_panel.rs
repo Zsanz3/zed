@@ -5062,6 +5062,15 @@ impl Panel for AgentPanel {
         position != DockPosition::Bottom
     }
 
+    fn flush_serialization(&mut self, _: &Workspace, cx: &mut Context<Self>) -> Task<()> {
+        let pending = self.pending_serialization.take();
+        cx.background_spawn(async move {
+            if let Some(pending) = pending {
+                pending.await.log_err();
+            }
+        })
+    }
+
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         let side = match position {
             DockPosition::Left => "left",

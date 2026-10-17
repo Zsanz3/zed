@@ -8,12 +8,15 @@ use db::{
     },
     sqlez_macros::sql,
 };
+use encoding_rs::Encoding;
 use fs::MTime;
 use itertools::Itertools as _;
+use language::Buffer;
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use text::LineEnding;
 
 use workspace::{ItemId, WorkspaceDb, WorkspaceId};
 
@@ -24,11 +27,89 @@ pub(crate) struct SerializedEditor {
     pub(crate) language: Option<String>,
     pub(crate) mtime: Option<MTime>,
     pub(crate) recovered_from: Option<PathBuf>,
+    pub(crate) shared_buffer: Option<String>,
+    pub(crate) deleted_file: Option<DeletedFile>,
+    pub(crate) text_format: Option<TextFormat>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TextFormat {
+    pub(crate) line_ending: LineEnding,
+    pub(crate) encoding: &'static Encoding,
+    pub(crate) has_bom: bool,
+}
+
+impl TextFormat {
+    pub(crate) fn of(buffer: &Buffer) -> Self {
+        Self {
+            line_ending: buffer.line_ending(),
+            encoding: buffer.encoding(),
+            has_bom: buffer.has_bom(),
+        }
+    }
+
+    fn from_columns(
+        line_ending: Option<String>,
+        encoding: Option<String>,
+        has_bom: Option<bool>,
+    ) -> Option<Self> {
+        let line_ending = line_ending?;
+        let line_ending = [LineEnding::Unix, LineEnding::Windows]
+            .into_iter()
+            .find(|candidate| candidate.as_str() == line_ending)?;
+        let encoding = Encoding::for_label(encoding?.as_bytes())?;
+        Some(Self {
+            line_ending,
+            encoding,
+            has_bom: has_bom?,
+        })
+    }
+}
+
+impl StaticColumnCount for TextFormat {
+    fn column_count() -> usize {
+        3
+    }
+}
+
+impl Bind for TextFormat {
+    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
+        let start_index = statement.bind(&self.line_ending.as_str(), start_index)?;
+        let start_index = statement.bind(&self.encoding.name(), start_index)?;
+        statement.bind(&self.has_bom, start_index)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeletedFile {
+    pub(crate) dirty: bool,
+    pub(crate) read_only: bool,
+}
+
+impl StaticColumnCount for DeletedFile {
+    fn column_count() -> usize {
+        2
+    }
+}
+
+impl Bind for DeletedFile {
+    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
+        let start_index = statement.bind(&self.dirty, start_index)?;
+        statement.bind(&self.read_only, start_index)
+    }
+}
+
+impl Column for DeletedFile {
+    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
+        let (dirty, start_index) = bool::column(statement, start_index)?;
+        let (read_only, start_index) = bool::column(statement, start_index)?;
+        Ok((Self { dirty, read_only }, start_index))
+    }
 }
 
 impl StaticColumnCount for SerializedEditor {
     fn column_count() -> usize {
-        7
+        13
     }
 }
 
@@ -59,6 +140,9 @@ impl Bind for SerializedEditor {
             }
         };
         let start_index = statement.bind(&self.recovered_from, start_index)?;
+        let start_index = statement.bind(&self.shared_buffer, start_index)?;
+        let start_index = statement.bind(&self.deleted_file, start_index)?;
+        let start_index = statement.bind(&self.text_format, start_index)?;
         Ok(start_index)
     }
 }
@@ -79,6 +163,12 @@ impl Column for SerializedEditor {
             Column::column(statement, start_index)?;
         let (recovered_from, start_index): (Option<PathBuf>, i32) =
             Column::column(statement, start_index)?;
+        let (shared_buffer, start_index): (Option<String>, i32) =
+            Column::column(statement, start_index)?;
+        let (deleted_file, start_index) = Option::<DeletedFile>::column(statement, start_index)?;
+        let (line_ending, start_index) = Option::<String>::column(statement, start_index)?;
+        let (encoding, start_index) = Option::<String>::column(statement, start_index)?;
+        let (has_bom, start_index) = Option::<bool>::column(statement, start_index)?;
 
         let mtime = mtime_seconds
             .zip(mtime_nanos)
@@ -90,6 +180,9 @@ impl Column for SerializedEditor {
             language,
             mtime,
             recovered_from,
+            shared_buffer,
+            deleted_file,
+            text_format: TextFormat::from_columns(line_ending, encoding, has_bom),
         };
         Ok((editor, start_index))
     }
@@ -235,6 +328,16 @@ impl Domain for EditorDb {
         sql!(
             ALTER TABLE editors ADD COLUMN recovered_from BLOB;
         ),
+        sql!(
+            ALTER TABLE editors ADD COLUMN shared_buffer TEXT;
+        ),
+        sql!(
+            ALTER TABLE editors ADD COLUMN deleted_file_dirty INTEGER;
+            ALTER TABLE editors ADD COLUMN deleted_file_read_only INTEGER;
+            ALTER TABLE editors ADD COLUMN line_ending TEXT;
+            ALTER TABLE editors ADD COLUMN encoding TEXT;
+            ALTER TABLE editors ADD COLUMN has_bom INTEGER;
+        ),
     ];
 }
 
@@ -247,8 +350,19 @@ const MAX_QUERY_PLACEHOLDERS: usize = 32000;
 
 impl EditorDb {
     query! {
+        pub fn workspaces_with_unsaved_contents(item_kind: &str) -> Result<Vec<WorkspaceId>> {
+            SELECT DISTINCT editors.workspace_id FROM editors
+            JOIN items
+                ON items.workspace_id = editors.workspace_id
+                AND items.item_id = editors.item_id
+                AND items.kind = (?)
+            WHERE editors.contents IS NOT NULL OR editors.recovered_from IS NOT NULL
+        }
+    }
+
+    query! {
         pub fn get_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId) -> Result<Option<SerializedEditor>> {
-            SELECT path, buffer_path, contents, language, mtime_seconds, mtime_nanos, recovered_from FROM editors
+            SELECT path, buffer_path, contents, language, mtime_seconds, mtime_nanos, recovered_from, shared_buffer, deleted_file_dirty, deleted_file_read_only, line_ending, encoding, has_bom FROM editors
             WHERE item_id = ? AND workspace_id = ?
         }
     }
@@ -256,9 +370,9 @@ impl EditorDb {
     query! {
         pub async fn save_serialized_editor(item_id: ItemId, workspace_id: WorkspaceId, serialized_editor: SerializedEditor) -> Result<()> {
             INSERT INTO editors
-                (item_id, workspace_id, path, buffer_path, contents, language, mtime_seconds, mtime_nanos, recovered_from)
+                (item_id, workspace_id, path, buffer_path, contents, language, mtime_seconds, mtime_nanos, recovered_from, shared_buffer, deleted_file_dirty, deleted_file_read_only, line_ending, encoding, has_bom)
             VALUES
-                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT DO UPDATE SET
                 item_id = ?1,
                 workspace_id = ?2,
@@ -268,7 +382,13 @@ impl EditorDb {
                 language = ?6,
                 mtime_seconds = ?7,
                 mtime_nanos = ?8,
-                recovered_from = ?9
+                recovered_from = ?9,
+                shared_buffer = ?10,
+                deleted_file_dirty = ?11,
+                deleted_file_read_only = ?12,
+                line_ending = ?13,
+                encoding = ?14,
+                has_bom = ?15
         }
     }
 
@@ -439,7 +559,7 @@ mod tests {
             contents: None,
             language: None,
             mtime: None,
-            recovered_from: None,
+            ..SerializedEditor::default()
         };
 
         editor_db
@@ -459,7 +579,7 @@ mod tests {
             contents: Some("Test".to_owned()),
             language: Some("Go".to_owned()),
             mtime: None,
-            recovered_from: None,
+            ..SerializedEditor::default()
         };
 
         editor_db
@@ -479,7 +599,7 @@ mod tests {
             contents: None,
             language: None,
             mtime: None,
-            recovered_from: None,
+            ..SerializedEditor::default()
         };
 
         editor_db
@@ -499,7 +619,7 @@ mod tests {
             contents: None,
             language: None,
             mtime: Some(MTime::from_seconds_and_nanos(100, 42)),
-            recovered_from: None,
+            ..SerializedEditor::default()
         };
 
         editor_db

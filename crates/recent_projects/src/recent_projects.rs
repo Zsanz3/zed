@@ -18,9 +18,12 @@ use fs::Fs;
 mod wsl_picker;
 
 pub use dev_container_suggest::open_dev_container_from_cli;
-use remote::{RemoteConnectionOptions, same_remote_connection_identity};
+use remote::{RemoteConnectionOptions, RemoteConnectionTarget};
 pub use remote_connection::{KnownPassword, RemoteConnectionModal, connect, connect_with_modal};
-pub use remote_connections::{navigate_to_positions, open_remote_project, restore_remote_project};
+pub use remote_connections::{
+    navigate_to_positions, open_remote_project, restore_remote_project,
+    sync_ssh_connections_on_startup,
+};
 
 use disconnected_overlay::DisconnectedOverlay;
 use fuzzy_nucleo::{StringMatch, StringMatchCandidate, match_strings};
@@ -47,7 +50,7 @@ use ui::{
 use util::{ResultExt, paths::PathExt};
 use workspace::{
     HistoryManager, ModalView, MultiWorkspace, OpenMode, OpenOptions, OpenVisible, RecentWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId,
+    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceId, WorkspaceIdClaims,
     notifications::DetachAndPromptErr, with_active_or_new_workspace,
 };
 use zed_actions::{OpenDevContainer, OpenRecent, OpenRemote};
@@ -187,10 +190,6 @@ pub async fn get_recent_projects(
     }
 }
 
-pub async fn delete_recent_project(workspace_id: WorkspaceId, db: &WorkspaceDb) {
-    let _ = db.delete_workspace_by_id(workspace_id).await;
-}
-
 fn get_open_folders(workspace: &Workspace, cx: &App) -> Vec<OpenFolderEntry> {
     let project = workspace.project().read(cx);
     let connection_options = project.remote_connection_options(cx);
@@ -285,6 +284,7 @@ pub(crate) fn default_open_in_new_window(cx: &App) -> bool {
 }
 
 pub fn init(cx: &mut App) {
+    remote_connections::sync_ssh_connections_on_settings_change(cx);
     #[cfg(target_os = "windows")]
     cx.on_action(|open_wsl: &zed_actions::wsl_actions::OpenFolderInWsl, cx| {
         let create_new_window = open_wsl
@@ -2339,10 +2339,11 @@ impl RecentProjectsDelegate {
                 .upgrade()
                 .map(|ws| ws.read(cx).app_state().fs.clone());
             let db = WorkspaceDb::global(cx);
+            let claims = WorkspaceIdClaims::global(cx);
             cx.spawn_in(window, async move |this, cx| {
                 let Some(fs) = fs else { return };
                 let deleted_workspace_ids = db
-                    .delete_recent_workspace_group(&recent_workspace)
+                    .delete_recent_workspace_group(&recent_workspace, claims)
                     .await
                     .log_err()
                     .unwrap_or_default();
@@ -2448,9 +2449,11 @@ impl RecentProjectsDelegate {
     }
 
     fn is_in_current_window_groups(&self, workspace: &RecentWorkspace) -> bool {
-        self.window_project_groups
-            .iter()
-            .any(|key| key.matches(&workspace.project_group_key()))
+        let workspace_key = workspace.project_group_key();
+        self.window_project_groups.iter().any(|key| {
+            key.path_list() == workspace_key.path_list()
+                && same_remote_target(key.host().as_ref(), workspace_key.host().as_ref())
+        })
     }
 
     fn is_open_folder(&self, workspace: &RecentWorkspace) -> bool {
@@ -2466,10 +2469,7 @@ impl RecentProjectsDelegate {
         for workspace_path in workspace.paths.paths() {
             for open_folder in &self.open_folders {
                 if workspace_path == &open_folder.path
-                    && same_remote_connection_identity(
-                        workspace_host,
-                        open_folder.connection_options.as_ref(),
-                    )
+                    && same_remote_target(workspace_host, open_folder.connection_options.as_ref())
                 {
                     return true;
                 }
@@ -2488,6 +2488,13 @@ impl RecentProjectsDelegate {
             && !self.is_in_current_window_groups(workspace)
             && !self.is_open_folder(workspace)
     }
+}
+
+fn same_remote_target(
+    left: Option<&RemoteConnectionOptions>,
+    right: Option<&RemoteConnectionOptions>,
+) -> bool {
+    left.map(RemoteConnectionTarget::from) == right.map(RemoteConnectionTarget::from)
 }
 
 #[cfg(test)]

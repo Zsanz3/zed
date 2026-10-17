@@ -406,7 +406,7 @@ impl LocalBufferStore {
         let file = buffer.file().cloned();
         if file
             .as_ref()
-            .is_some_and(|file| file.disk_state() == DiskState::New)
+            .is_some_and(|file| matches!(file.disk_state(), DiskState::New | DiskState::Deleted))
         {
             has_changed_file = true;
         }
@@ -455,13 +455,35 @@ impl LocalBufferStore {
         cx: &mut Context<BufferStore>,
     ) {
         cx.subscribe(worktree, |this, worktree, event, cx| {
-            if worktree.read(cx).is_local()
-                && let worktree::Event::UpdatedEntries(changes) = event
-            {
-                Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+            if !worktree.read(cx).is_local() {
+                return;
+            }
+            match event {
+                worktree::Event::UpdatedEntries(changes) => {
+                    Self::local_worktree_entries_changed(this, &worktree, changes, cx);
+                }
+                worktree::Event::Deleted => Self::local_worktree_deleted(this, &worktree, cx),
+                _ => {}
             }
         })
         .detach();
+    }
+
+    fn local_worktree_deleted(
+        this: &mut BufferStore,
+        worktree: &Entity<Worktree>,
+        cx: &mut Context<BufferStore>,
+    ) {
+        let buffers = this
+            .buffers()
+            .filter(|buffer| {
+                File::from_dyn(buffer.read(cx).file())
+                    .is_some_and(|file| file.worktree == *worktree && file.disk_state.exists())
+            })
+            .collect::<Vec<_>>();
+        for buffer in buffers {
+            this.mark_file_deleted(&buffer, cx);
+        }
     }
 
     fn local_worktree_entries_changed(
@@ -1175,6 +1197,40 @@ impl BufferStore {
             .retain(|_, buffer| !matches!(buffer, OpenBuffer::Operations(_)));
     }
 
+    pub fn mark_file_deleted(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
+            return;
+        };
+        if file.disk_state == DiskState::Deleted {
+            return;
+        }
+        let deleted_file = File {
+            disk_state: DiskState::Deleted,
+            ..file.clone()
+        };
+        let update = |project_id| proto::UpdateBufferFile {
+            project_id,
+            buffer_id: buffer.read(cx).remote_id().to_proto(),
+            file: Some(deleted_file.to_proto(cx)),
+        };
+        match &self.state {
+            BufferStoreState::Remote(remote) if !remote.upstream_client.is_via_collab() => {
+                remote
+                    .upstream_client
+                    .send(update(remote.project_id))
+                    .log_err();
+            }
+            _ => {
+                if let Some((downstream_client, project_id)) = &self.downstream_client {
+                    downstream_client.send(update(*project_id)).log_err();
+                }
+            }
+        }
+        buffer.update(cx, |buffer, cx| {
+            buffer.file_updated(Arc::new(deleted_file), cx)
+        });
+    }
+
     fn buffer_changed_file(&mut self, buffer: Entity<Buffer>, cx: &mut App) -> Option<()> {
         let file = File::from_dyn(buffer.read(cx).file())?;
 
@@ -1396,6 +1452,20 @@ impl BufferStore {
         let buffer_id = BufferId::new(buffer_id)?;
 
         this.update(&mut cx, |this, cx| {
+            if this.as_local_mut().is_some() {
+                if envelope
+                    .payload
+                    .file
+                    .as_ref()
+                    .is_some_and(|file| file.is_deleted)
+                    && let Some(buffer) = this.get(buffer_id)
+                    && File::from_dyn(buffer.read(cx).file())
+                        .is_some_and(|file| file.disk_state == DiskState::New)
+                {
+                    this.mark_file_deleted(&buffer, cx);
+                }
+                return Ok(());
+            }
             let payload = envelope.payload.clone();
             if let Some(buffer) = this.get_possibly_incomplete(buffer_id) {
                 let file = payload.file.context("invalid file")?;

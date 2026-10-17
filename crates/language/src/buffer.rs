@@ -1731,7 +1731,9 @@ impl Buffer {
 
             let diff = this.update(cx, |this, cx| this.diff(new_text, cx))?.await;
             this.update(cx, |this, cx| {
-                if this.version() == diff.base_version {
+                if this.version() == diff.base_version
+                    && this.edits_since::<usize>(&prev_version).next().is_none()
+                {
                     this.finalize_last_transaction();
                     let old_encoding = this.encoding;
                     let old_has_bom = this.has_bom;

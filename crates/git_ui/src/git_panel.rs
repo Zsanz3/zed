@@ -546,7 +546,7 @@ pub enum Event {
     Focus,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct SerializedGitPanel {
     #[serde(default)]
     signoff_enabled: bool,
@@ -1156,6 +1156,7 @@ pub struct GitPanel {
     signoff_enabled: bool,
     skip_hooks_enabled: bool,
     pending_serialization: Task<()>,
+    unwritten_serialization: Option<SerializedGitPanel>,
     pub(crate) project: Entity<Project>,
     scroll_handle: UniformListScrollHandle,
     max_width_item_index: Option<usize>,
@@ -1492,6 +1493,7 @@ impl GitPanel {
                 signoff_enabled,
                 skip_hooks_enabled: false,
                 pending_serialization: Task::ready(()),
+                unwritten_serialization: None,
                 single_staged_entry: None,
                 single_tracked_entry: None,
                 project,
@@ -1948,47 +1950,52 @@ impl GitPanel {
     }
 
     fn serialize(&mut self, cx: &mut Context<Self>) {
-        let signoff_enabled = self.signoff_enabled;
-        let commit_editor_collapsed = self
-            .commit_editor_toggled
-            .then_some(self.commit_editor_collapsed);
-        let commit_messages = self.serialized_commit_messages(cx);
-        let kvp = KeyValueStore::global(cx);
-
+        let serialized = self.serialized_state(cx);
+        self.unwritten_serialization = Some(serialized.clone());
         self.pending_serialization = cx.spawn(async move |git_panel, cx| {
             cx.background_executor()
                 .timer(SERIALIZATION_THROTTLE_TIME)
                 .await;
-            let Some(serialization_key) = git_panel
-                .update(cx, |git_panel, cx| {
-                    git_panel
-                        .workspace
-                        .read_with(cx, |workspace, _| Self::serialization_key(workspace))
-                        .ok()
-                        .flatten()
-                })
-                .ok()
-                .flatten()
-            else {
+            let Ok(write) = git_panel.update(cx, |git_panel, cx| {
+                git_panel.unwritten_serialization = None;
+                let serialization_key = git_panel
+                    .workspace
+                    .read_with(cx, |workspace, _| Self::serialization_key(workspace))
+                    .ok()
+                    .flatten();
+                Self::write_serialized_state(serialized, serialization_key, cx)
+            }) else {
                 return;
             };
-            cx.background_spawn(
-                async move {
-                    kvp.write_kvp(
-                        serialization_key,
-                        serde_json::to_string(&SerializedGitPanel {
-                            signoff_enabled,
-                            commit_messages,
-                            commit_editor_collapsed,
-                        })?,
-                    )
-                    .await?;
-                    anyhow::Ok(())
-                }
-                .log_err(),
-            )
-            .await;
+            write.await;
         });
+    }
+
+    fn serialized_state(&self, cx: &App) -> SerializedGitPanel {
+        SerializedGitPanel {
+            signoff_enabled: self.signoff_enabled,
+            commit_messages: self.serialized_commit_messages(cx),
+            commit_editor_collapsed: self
+                .commit_editor_toggled
+                .then_some(self.commit_editor_collapsed),
+        }
+    }
+
+    fn write_serialized_state(
+        serialized: SerializedGitPanel,
+        serialization_key: Option<String>,
+        cx: &App,
+    ) -> Task<()> {
+        let Some(serialization_key) = serialization_key else {
+            return Task::ready(());
+        };
+        let kvp = KeyValueStore::global(cx);
+        cx.background_spawn(async move {
+            let Some(serialized) = serde_json::to_string(&serialized).log_err() else {
+                return;
+            };
+            kvp.write_kvp(serialization_key, serialized).await.log_err();
+        })
     }
 
     fn serialized_commit_messages(&self, cx: &App) -> BTreeMap<String, SerializedCommitMessage> {
@@ -9513,6 +9520,16 @@ impl Panel for GitPanel {
 
     fn position_is_valid(&self, position: DockPosition) -> bool {
         matches!(position, DockPosition::Left | DockPosition::Right)
+    }
+
+    fn flush_serialization(&mut self, workspace: &Workspace, cx: &mut Context<Self>) -> Task<()> {
+        let pending = std::mem::replace(&mut self.pending_serialization, Task::ready(()));
+        match self.unwritten_serialization.take() {
+            Some(serialized) => {
+                Self::write_serialized_state(serialized, Self::serialization_key(workspace), cx)
+            }
+            None => cx.spawn(async move |_, _| pending.await),
+        }
     }
 
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {

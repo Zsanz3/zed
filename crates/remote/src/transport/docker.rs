@@ -3,7 +3,6 @@ use anyhow::Result;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use collections::HashMap;
-use parking_lot::Mutex;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
 use semver::Version as SemanticVersion;
 use std::collections::BTreeMap;
@@ -31,7 +30,7 @@ use crate::{
     RemotePlatform,
     command::RemoteCommand,
     remote_client::{CommandTemplate, Interactive},
-    transport::parse_platform,
+    transport::{ProxyProcesses, parse_platform},
 };
 
 #[derive(
@@ -56,7 +55,7 @@ pub struct DockerConnectionOptions {
 }
 
 pub(crate) struct DockerExecConnection {
-    proxy_process: Mutex<Option<u32>>,
+    proxies: ProxyProcesses,
     remote_dir_for_server: String,
     remote_binary_relpath: Option<Arc<RelPath>>,
     connection_options: DockerConnectionOptions,
@@ -73,7 +72,7 @@ impl DockerExecConnection {
         cx: &mut AsyncApp,
     ) -> Result<Self> {
         let mut this = Self {
-            proxy_process: Mutex::new(None),
+            proxies: ProxyProcesses::default(),
             remote_dir_for_server: "/".to_string(),
             remote_binary_relpath: None,
             connection_options,
@@ -250,14 +249,13 @@ impl DockerExecConnection {
         )
         .await?
         {
-            let tmp_path = paths::remote_server_dir_relative().join(
-                RelPath::from_unix_str(&format!(
-                    "download-{}-{}",
-                    super::staging_file_suffix(),
+            let tmp_path = super::staging_file_path(
+                &binary_name,
+                &format!(
+                    "-{}",
                     remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
-            );
+                ),
+            )?;
             self.upload_local_server_binary(
                 &remote_server_path,
                 &tmp_path,
@@ -286,14 +284,7 @@ impl DockerExecConnection {
             _ => Ok(Some(AppVersion::global(cx))),
         })?;
 
-        let tmp_path_gz = paths::remote_server_dir_relative().join(
-            RelPath::from_unix_str(&format!(
-                "{}-download-{}.gz",
-                binary_name,
-                super::staging_file_suffix()
-            ))
-            .unwrap(),
-        );
+        let tmp_path_gz = super::staging_file_path(&binary_name, ".gz")?;
         if !self.connection_options.upload_binary_over_docker_exec
             && let Some(url) = delegate
                 .get_download_url(remote_platform, release_channel, wanted_version.clone(), cx)
@@ -641,21 +632,6 @@ impl DockerExecConnection {
         }
         Ok(())
     }
-
-    fn kill_inner(&self) -> Result<()> {
-        if let Some(pid) = self.proxy_process.lock().take() {
-            if let Ok(_) = util::command::new_command("kill")
-                .arg(pid.to_string())
-                .spawn()
-            {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("Failed to kill process"))
-            }
-        } else {
-            Ok(())
-        }
-    }
 }
 
 #[async_trait(?Send)]
@@ -673,13 +649,6 @@ impl RemoteConnection for DockerExecConnection {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
-        // We'll try connecting anew every time we open a devcontainer, so proactively try to kill any old connections.
-        if !self.has_been_killed() {
-            if let Err(e) = self.kill_inner() {
-                return Task::ready(Err(e));
-            };
-        }
-
         delegate.set_status(Some("Starting proxy"), cx);
 
         let Some(remote_binary_relpath) = self.remote_binary_relpath.clone() else {
@@ -709,12 +678,7 @@ impl RemoteConnection for DockerExecConnection {
             .display(self.path_style())
             .into_owned();
         docker_args.push(val);
-        docker_args.push("proxy".to_string());
-        docker_args.push("--identifier".to_string());
-        docker_args.push(unique_identifier);
-        if reconnect {
-            docker_args.push("--reconnect".to_string());
-        }
+        docker_args.extend(super::proxy_arguments(unique_identifier, reconnect));
         let mut command = util::command::new_command(self.docker_cli());
         command
             .kill_on_drop(true)
@@ -729,25 +693,8 @@ impl RemoteConnection for DockerExecConnection {
             )));
         };
 
-        let mut proxy_process = self.proxy_process.lock();
-        *proxy_process = Some(child.id());
-
-        cx.spawn(async move |cx| {
-            super::handle_rpc_messages_over_child_process_stdio(
-                child,
-                incoming_tx,
-                outgoing_rx,
-                connection_activity_tx,
-                cx,
-            )
-            .await
-            .and_then(|status| {
-                if status != 0 {
-                    anyhow::bail!("Remote server exited with status {status}");
-                }
-                Ok(0)
-            })
-        })
+        self.proxies
+            .run(child, incoming_tx, outgoing_rx, connection_activity_tx, cx)
     }
 
     fn upload_directory(
@@ -770,11 +717,12 @@ impl RemoteConnection for DockerExecConnection {
     }
 
     async fn kill(&self) -> Result<()> {
-        self.kill_inner()
+        self.proxies.kill();
+        Ok(())
     }
 
     fn has_been_killed(&self) -> bool {
-        self.proxy_process.lock().is_none()
+        self.proxies.has_been_killed()
     }
 
     fn build_command(
@@ -1180,7 +1128,7 @@ mod tests {
 
     fn connection(remote_env: &[(&str, &str)]) -> DockerExecConnection {
         DockerExecConnection {
-            proxy_process: Mutex::new(None),
+            proxies: ProxyProcesses::default(),
             remote_dir_for_server: "/tmp/zed".to_string(),
             remote_binary_relpath: None,
             connection_options: DockerConnectionOptions {

@@ -809,7 +809,7 @@ mod tests {
                 active_item
                     .to_serializable_item_handle(cx)
                     .unwrap()
-                    .serialized_item_kind(),
+                    .serialized_item_kind(cx),
                 "StagedDiff"
             );
             assert_eq!(active_item.tab_content_text(0, cx), "Staged Changes");
@@ -1032,7 +1032,7 @@ mod tests {
                 active_item
                     .to_serializable_item_handle(cx)
                     .unwrap()
-                    .serialized_item_kind(),
+                    .serialized_item_kind(cx),
                 "StagedDiff"
             );
             assert_eq!(active_item.tab_content_text(0, cx), "Staged Changes");

@@ -97,19 +97,31 @@ pub fn same_remote_connection_identity(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RemoteConnectionTarget {
+    identity: RemoteConnectionIdentity,
+    ssh_args: Option<Vec<String>>,
+}
+
+impl From<&RemoteConnectionOptions> for RemoteConnectionTarget {
+    fn from(options: &RemoteConnectionOptions) -> Self {
+        Self {
+            identity: RemoteConnectionIdentity::from(options),
+            ssh_args: match options {
+                RemoteConnectionOptions::Ssh(options) => {
+                    Some(options.args.clone().unwrap_or_default())
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
 pub fn same_remote_connection_target(
     left: &RemoteConnectionOptions,
     right: &RemoteConnectionOptions,
 ) -> bool {
-    remote_connection_identity(left) == remote_connection_identity(right)
-        && remote_connection_target_args(left) == remote_connection_target_args(right)
-}
-
-pub fn remote_connection_target_args(options: &RemoteConnectionOptions) -> Option<&[String]> {
-    match options {
-        RemoteConnectionOptions::Ssh(options) => Some(options.args.as_deref().unwrap_or_default()),
-        _ => None,
-    }
+    RemoteConnectionTarget::from(left) == RemoteConnectionTarget::from(right)
 }
 
 #[cfg(test)]
@@ -213,25 +225,39 @@ mod tests {
     }
 
     #[test]
-    fn ssh_target_includes_connection_arguments() {
-        let ssh = |args: Option<&[&str]>| {
+    fn ssh_target_is_the_exact_saved_invocation() {
+        let ssh = |args: Option<&[&str]>, nickname: Option<&str>, password: Option<&str>| {
             RemoteConnectionOptions::Ssh(SshConnectionOptions {
                 host: "target".into(),
                 args: args.map(|args| args.iter().map(|arg| arg.to_string()).collect()),
-                nickname: args.map(|_| "nickname".to_string()),
+                nickname: nickname.map(String::from),
+                password: password.map(String::from),
                 ..Default::default()
             })
         };
-        let host_a = ssh(Some(&["-o", "Hostname=host-a"]));
-        let host_b = ssh(Some(&["-o", "Hostname=host-b"]));
-
+        let blue = ["-oHostKeyAlias=blue"];
+        let cases = [
+            (
+                ssh(Some(&blue), None, None),
+                ssh(Some(&blue), Some("n"), Some("p")),
+            ),
+            (ssh(None, None, None), ssh(Some(&[]), None, None)),
+            (
+                ssh(Some(&blue), None, None),
+                ssh(Some(&["-oHostKeyAlias=green"]), None, None),
+            ),
+            (
+                ssh(Some(&["-v", "-4"]), None, None),
+                ssh(Some(&["-4", "-v"]), None, None),
+            ),
+            (ssh(Some(&blue), None, None), ssh(None, None, None)),
+        ];
         assert_eq!(
-            [
-                same_remote_connection_target(&host_a, &host_a),
-                same_remote_connection_target(&host_a, &host_b),
-                same_remote_connection_target(&ssh(None), &ssh(Some(&[]))),
-            ],
-            [true, false, true]
+            cases
+                .iter()
+                .map(|(left, right)| same_remote_connection_target(left, right))
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false, false]
         );
     }
 }

@@ -51,7 +51,7 @@ use ui::{
 use util::ResultExt;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items_keeping,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
@@ -1727,80 +1727,12 @@ impl Item for TerminalView {
                 return false;
             };
 
-            if item.downcast::<TerminalView>().is_some() {
-                let Some(split_direction) = active_pane.drag_split_direction() else {
-                    return false;
-                };
-
-                let Some(terminal_panel) = workspace.read(cx).panel::<TerminalPanel>(cx) else {
-                    return false;
-                };
-
-                if !terminal_panel.read(cx).center.panes().contains(&&this_pane) {
-                    return false;
-                }
-
-                let source = tab.pane.clone();
-                let item_id_to_move = item.item_id();
-                let is_zoomed = {
-                    let terminal_panel = terminal_panel.read(cx);
-                    if terminal_panel.active_pane == this_pane {
-                        active_pane.is_zoomed()
-                    } else {
-                        terminal_panel.active_pane.read(cx).is_zoomed()
-                    }
-                };
-
-                let workspace = workspace.downgrade();
-                let terminal_panel = terminal_panel.downgrade();
-                // Defer the split operation to avoid re-entrancy panic.
-                // The pane may be the one currently being updated, so we cannot
-                // call mark_positions (via split) synchronously.
-                window
-                    .spawn(cx, async move |cx| {
-                        cx.update(|window, cx| {
-                            let Ok(new_pane) = terminal_panel.update(cx, |terminal_panel, cx| {
-                                let new_pane = terminal_panel::new_terminal_pane(
-                                    workspace, project, is_zoomed, window, cx,
-                                );
-                                terminal_panel.apply_tab_bar_buttons(&new_pane, cx);
-                                terminal_panel.center.split(
-                                    &this_pane,
-                                    &new_pane,
-                                    split_direction,
-                                    cx,
-                                );
-                                anyhow::Ok(new_pane)
-                            }) else {
-                                return;
-                            };
-
-                            let Some(new_pane) = new_pane.log_err() else {
-                                return;
-                            };
-
-                            workspace::move_item(
-                                &source,
-                                &new_pane,
-                                item_id_to_move,
-                                new_pane.read(cx).active_item_index(),
-                                true,
-                                window,
-                                cx,
-                            );
-                        })
-                        .ok();
-                    })
-                    .detach();
-
+            if item.downcast::<TerminalView>().is_none()
+                && let Some(project_path) = item.project_path(cx)
+                && let Some(path) = project.read(cx).absolute_path(&project_path, cx)
+            {
+                self.add_paths_to_terminal(&[path], window, cx);
                 return true;
-            } else {
-                if let Some(project_path) = item.project_path(cx)
-                    && let Some(path) = project.read(cx).absolute_path(&project_path, cx)
-                {
-                    self.add_paths_to_terminal(&[path], window, cx);
-                    return true;
-                }
             }
 
             return false;
@@ -1966,7 +1898,14 @@ impl SerializableItem for TerminalView {
         cx: &mut App,
     ) -> Task<anyhow::Result<()>> {
         let db = TerminalDb::global(cx);
-        delete_unloaded_items(alive_items, workspace_id, "terminals", &db, cx)
+        delete_unloaded_items_keeping(
+            alive_items,
+            workspace_id,
+            "terminals",
+            &db,
+            persistence::persisted_panel_item_ids,
+            cx,
+        )
     }
 
     fn serialize(
@@ -2046,7 +1985,7 @@ impl SerializableItem for TerminalView {
                 .update(cx, |project, cx| project.create_terminal_shell(cwd, cx))
                 .await?;
             cx.update(|window, cx| {
-                let view = cx.new(|cx| {
+                cx.new(|cx| {
                     let mut view = TerminalView::new(
                         terminal,
                         workspace,
@@ -2058,12 +1997,9 @@ impl SerializableItem for TerminalView {
                     if custom_title.is_some() {
                         view.custom_title = custom_title;
                     }
+                    view.needs_serialize = true;
                     view
-                });
-                if workspace::claim_persistent_item_id(&view, item_id, cx) != item_id {
-                    view.update(cx, |view, _| view.needs_serialize = true);
-                }
-                view
+                })
             })
         })
     }

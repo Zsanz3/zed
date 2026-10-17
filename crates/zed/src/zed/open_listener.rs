@@ -12,11 +12,10 @@ use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use futures::channel::{mpsc, oneshot};
 use futures::future;
 
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
+use futures::{FutureExt, StreamExt, future::LocalBoxFuture};
 use git_ui::multi_diff_view::MultiDiffView;
 use git_ui_core::file_diff_view::FileDiffView;
-use gpui::{App, AsyncApp, Global, Task, WindowHandle};
+use gpui::{AnyWindowHandle, App, AsyncApp, Global, Task, WindowHandle};
 use onboarding::FIRST_OPEN;
 use onboarding::show_onboarding_view;
 use recent_projects::{
@@ -25,6 +24,7 @@ use recent_projects::{
 };
 use remote::{RemoteConnectionOptions, WslConnectionOptions};
 use settings::Settings;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -36,10 +36,7 @@ use util::debug_panic;
 use util::paths::PathWithPosition;
 use workspace::PathList;
 use workspace::item::ItemHandle;
-use workspace::{
-    AppState, CliEnvironmentAssignment, CliEnvironmentGate, MultiWorkspace, OpenOptions,
-    OpenResult, SerializedWorkspaceLocation, Workspace,
-};
+use workspace::{AppState, MultiWorkspace, OpenOptions, OpenResult, SerializedWorkspaceLocation};
 
 #[derive(Default, Debug)]
 pub struct OpenRequest {
@@ -89,7 +86,6 @@ pub struct CliConnection {
     requests: mpsc::UnboundedReceiver<CliRequest>,
     responses: Box<dyn CliResponseSink>,
     first_request: Option<CliRequest>,
-    cli_environment: Option<CliEnvironmentAssignment>,
 }
 
 impl CliConnection {
@@ -101,7 +97,6 @@ impl CliConnection {
             requests,
             responses,
             first_request: None,
-            cli_environment: None,
         }
     }
 
@@ -119,10 +114,17 @@ impl CliConnection {
 
 #[derive(Clone)]
 pub(crate) struct StartupRestoration {
+    pub(crate) planned: Rc<Vec<PlannedRestoration>>,
     pub(crate) finished: future::Shared<Task<()>>,
-    pub(crate) remote: future::Shared<Task<Rc<Vec<RemoteRestoration>>>>,
-    pub(crate) windows_opened: future::Shared<Task<()>>,
     pub(crate) dedupe_restored_roots: bool,
+    pub(crate) requested_window: Rc<Cell<Option<AnyWindowHandle>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PlannedRestoration {
+    pub(crate) roots: Vec<PathBuf>,
+    pub(crate) window_opened: future::Shared<Task<Option<WindowHandle<MultiWorkspace>>>>,
+    pub(crate) remote: Option<RemoteRestoration>,
 }
 
 #[derive(Clone)]
@@ -130,81 +132,200 @@ pub(crate) struct RemoteRestoration {
     pub(crate) connection_options: RemoteConnectionOptions,
     pub(crate) connected: future::Shared<Task<bool>>,
     pub(crate) known_password: KnownPassword,
+    pub(crate) local_group_roots: Vec<PathBuf>,
+    pub(crate) state_applied: future::Shared<Task<()>>,
 }
 
 impl StartupRestoration {
-    pub(crate) fn remote_restored(
+    pub(crate) fn for_arriving_request(&self) -> Option<Self> {
+        if !self.is_pending() {
+            return None;
+        }
+        Some(Self {
+            dedupe_restored_roots: self.opening_windows(),
+            ..self.clone()
+        })
+    }
+
+    pub(crate) fn claim_window(&self, window: AnyWindowHandle) {
+        self.requested_window.set(Some(window));
+    }
+
+    pub(crate) fn ready_for(
+        &self,
+        request: &OpenRequest,
+        fs: Arc<dyn Fs>,
+    ) -> LocalBoxFuture<'static, ()> {
+        if request.open_behavior == Some(cli::OpenBehavior::AlwaysNew) {
+            return future::ready(()).boxed_local();
+        }
+        if let Some(connection_options) = &request.remote_connection {
+            return self.remote_restored(connection_options).boxed_local();
+        }
+        self.local_paths_restored(
+            fs,
+            request
+                .open_paths
+                .iter()
+                .chain(request.diff_paths.iter().flatten())
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub(crate) fn local_paths_restored(
+        &self,
+        fs: Arc<dyn Fs>,
+        requested_paths: Vec<String>,
+    ) -> LocalBoxFuture<'static, ()> {
+        let restoration = self.clone();
+        async move {
+            let requested_paths = derive_paths_with_position(fs.as_ref(), requested_paths)
+                .await
+                .into_iter()
+                .map(|path_with_position| path_with_position.path)
+                .collect::<Vec<_>>();
+            let mut targets = Vec::<LocalBoxFuture<'static, ()>>::new();
+            for planned in restoration.planned.iter() {
+                match &planned.remote {
+                    None => {
+                        if any_path_within_roots(fs.as_ref(), &requested_paths, &planned.roots)
+                            .await
+                        {
+                            targets.push(planned.window_opened.clone().map(drop).boxed_local());
+                        }
+                    }
+                    Some(remote) => {
+                        if any_path_within_roots(
+                            fs.as_ref(),
+                            &requested_paths,
+                            &remote.local_group_roots,
+                        )
+                        .await
+                        {
+                            targets.push(remote.state_applied.clone().boxed_local());
+                        }
+                    }
+                }
+            }
+            if targets.is_empty() {
+                restoration.local_window_restored().await;
+            } else {
+                future::join_all(targets).await;
+            }
+        }
+        .boxed_local()
+    }
+
+    pub(crate) fn any_window_restored(&self) -> LocalBoxFuture<'static, ()> {
+        let window_restored = self.first_window_restored(|_| true);
+        let finished = self.finished.clone();
+        async move {
+            if !window_restored.await {
+                finished.await;
+            }
+        }
+        .boxed_local()
+    }
+
+    fn local_window_restored(&self) -> LocalBoxFuture<'static, ()> {
+        let local_window_restored = self.first_window_restored(|planned| planned.remote.is_none());
+        let any_window_restored = self.any_window_restored();
+        async move {
+            if !local_window_restored.await {
+                any_window_restored.await;
+            }
+        }
+        .boxed_local()
+    }
+
+    fn first_window_restored(
+        &self,
+        include: impl Fn(&PlannedRestoration) -> bool,
+    ) -> LocalBoxFuture<'static, bool> {
+        let mut windows = self
+            .planned
+            .iter()
+            .filter(|planned| include(planned))
+            .map(|planned| planned.window_opened.clone())
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        async move {
+            while let Some(window) = windows.next().await {
+                if window.is_some() {
+                    return true;
+                }
+            }
+            false
+        }
+        .boxed_local()
+    }
+
+    fn is_pending(&self) -> bool {
+        self.finished.clone().now_or_never().is_none()
+    }
+
+    fn opening_windows(&self) -> bool {
+        self.planned
+            .iter()
+            .any(|planned| planned.window_opened.clone().now_or_never().is_none())
+    }
+
+    fn remote_restored(
         &self,
         connection_options: &RemoteConnectionOptions,
     ) -> impl Future<Output = ()> + use<> {
-        let remote = self.remote.clone();
-        let connection_options = connection_options.clone();
-        async move {
-            let remote = remote.await;
-            future::join_all(
-                remote
-                    .iter()
-                    .filter(|restoration| {
-                        workspace::remote_locations_match(
-                            &restoration.connection_options,
-                            &connection_options,
-                        )
-                    })
-                    .map(|restoration| {
-                        restoration
-                            .known_password
-                            .provide_for_connection(&connection_options);
-                        restoration.connected.clone()
-                    }),
-            )
-            .await;
-        }
+        future::join_all(
+            self.planned
+                .iter()
+                .filter_map(|planned| planned.remote.as_ref())
+                .filter(|restoration| {
+                    workspace::remote_locations_match(
+                        &restoration.connection_options,
+                        connection_options,
+                    )
+                })
+                .map(|restoration| {
+                    restoration
+                        .known_password
+                        .provide_for_connection(connection_options);
+                    restoration.connected.clone()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .map(drop)
     }
+}
 
-    pub(crate) fn windows_opened_for(
+pub(crate) struct StartupEnvironment {
+    paths: Vec<PathBuf>,
+    env: collections::HashMap<String, String>,
+}
+
+impl StartupEnvironment {
+    pub(crate) async fn for_roots(
         &self,
-        open_behavior: Option<cli::OpenBehavior>,
-    ) -> impl Future<Output = ()> + use<> {
-        let windows_opened = (open_behavior != Some(cli::OpenBehavior::AlwaysNew))
-            .then(|| self.windows_opened.clone());
-        async move {
-            if let Some(windows_opened) = windows_opened {
-                windows_opened.await;
-            }
-        }
+        fs: &dyn Fs,
+        roots: &[PathBuf],
+    ) -> Option<collections::HashMap<String, String>> {
+        any_path_within_roots(fs, &self.paths, roots)
+            .await
+            .then(|| self.env.clone())
     }
+}
 
-    pub(crate) fn workspace_window_ready(&self, cx: &mut App) -> impl Future<Output = ()> + use<> {
-        let (workspace_created_tx, mut workspace_created_rx) = mpsc::unbounded();
-        let workspace_created = cx.observe_new::<Workspace>(move |_, _, cx| {
-            let workspace_created_tx = workspace_created_tx.clone();
-            cx.defer(move |_| {
-                workspace_created_tx.unbounded_send(()).ok();
-            });
-        });
-        let mut finished = self.finished.clone().fuse();
-        let mut remote = self.remote.clone().fuse();
-        let cx = cx.to_async();
-        async move {
-            let _workspace_created = workspace_created;
-            let mut remote_restorations = FuturesUnordered::new();
-            while !cx.update(|cx| workspace::has_ready_workspace_window(cx)) {
-                let mut workspace_restorations = cx
-                    .update(|cx| workspace::pending_workspace_restorations(cx))
-                    .into_iter()
-                    .collect::<FuturesUnordered<_>>();
-                futures::select_biased! {
-                    _ = finished => return,
-                    remote = remote => remote_restorations.extend(
-                        remote.iter().map(|restoration| restoration.connected.clone()),
-                    ),
-                    _ = remote_restorations.select_next_some() => {}
-                    _ = workspace_restorations.select_next_some() => {}
-                    _ = workspace_created_rx.next() => {}
-                }
-            }
+async fn any_path_within_roots(fs: &dyn Fs, paths: &[PathBuf], roots: &[PathBuf]) -> bool {
+    for root in roots {
+        let canonical_root = fs.canonicalize(root).await.ok();
+        if paths.iter().any(|path| {
+            path.starts_with(root)
+                || canonical_root
+                    .as_ref()
+                    .is_some_and(|canonical_root| path.starts_with(canonical_root))
+        }) {
+            return true;
         }
     }
+    false
 }
 
 impl std::fmt::Debug for OpenRequestKind {
@@ -378,40 +499,41 @@ impl OpenRequest {
             .is_ok_and(|request| request.opens_paths())
     }
 
-    pub(crate) fn hand_off_cli_environment(&mut self) -> Option<CliEnvironmentGate> {
-        let Some(OpenRequestKind::CliConnection(connection)) = &mut self.kind else {
+    pub(crate) async fn startup_environment(&self, fs: &dyn Fs) -> Option<StartupEnvironment> {
+        let Some(OpenRequestKind::CliConnection(CliConnection {
+            first_request:
+                Some(CliRequest::Open {
+                    urls,
+                    paths,
+                    diff_paths,
+                    open_behavior,
+                    env: Some(env),
+                    cwd,
+                    ..
+                }),
+            ..
+        })) = &self.kind
+        else {
             return None;
         };
-        let environment = match &connection.first_request {
-            Some(CliRequest::Open {
-                urls,
-                paths,
-                diff_paths,
+        if !urls.is_empty()
+            || matches!(
                 open_behavior,
-                env: Some(env),
-                ..
-            }) if cli_environment_applies(urls, paths, diff_paths, *open_behavior) => env.clone(),
-            _ => return None,
-        };
-        let (assignment, gate) = workspace::cli_environment_handoff(environment);
-        connection.cli_environment = Some(assignment);
-        Some(gate)
-    }
-
-    pub(crate) fn targets_any_workspace(&self) -> bool {
-        match &self.kind {
-            Some(
-                OpenRequestKind::CliConnection(_)
-                | OpenRequestKind::FocusApp
-                | OpenRequestKind::DockMenuAction { .. }
-                | OpenRequestKind::GitCommit { .. },
-            ) => false,
-            Some(_) => true,
-            None => {
-                self.remote_connection.is_none()
-                    && (self.join_channel.is_some() || !self.open_channel_notes.is_empty())
-            }
+                cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::Reuse
+            )
+        {
+            return None;
         }
+        let paths =
+            derive_paths_with_position(fs, cli_target_paths(paths, diff_paths, cwd.as_deref()))
+                .await
+                .into_iter()
+                .map(|path_with_position| path_with_position.path)
+                .collect();
+        Some(StartupEnvironment {
+            paths,
+            env: env.clone(),
+        })
     }
 
     fn opens_paths(&self) -> bool {
@@ -664,6 +786,44 @@ fn connect_to_cli(server_name: &str) -> Result<CliConnection> {
     Ok(CliConnection::new(async_request_rx, Box::new(response_tx)))
 }
 
+#[derive(Default)]
+struct CliOpenContext {
+    cwd: Option<PathBuf>,
+    restoration: Option<StartupRestoration>,
+}
+
+impl CliOpenContext {
+    fn claim_window(&self, window: WindowHandle<MultiWorkspace>) {
+        if let Some(restoration) = self.restoration.as_ref() {
+            restoration.claim_window(AnyWindowHandle::from(window));
+        }
+    }
+}
+
+fn cli_workspace_paths(
+    paths: &[String],
+    diff_paths: &[[String; 2]],
+    cwd: Option<&Path>,
+) -> Vec<String> {
+    match cwd {
+        Some(cwd) if paths.is_empty() && !diff_paths.is_empty() => {
+            vec![cwd.to_string_lossy().into_owned()]
+        }
+        _ => paths.to_vec(),
+    }
+}
+
+fn cli_target_paths(
+    paths: &[String],
+    diff_paths: &[[String; 2]],
+    cwd: Option<&Path>,
+) -> Vec<String> {
+    cli_workspace_paths(paths, diff_paths, cwd)
+        .into_iter()
+        .chain(diff_paths.iter().flatten().cloned())
+        .collect()
+}
+
 pub async fn open_paths_with_positions(
     path_positions: &[PathWithPosition],
     diff_paths: &[[String; 2]],
@@ -688,7 +848,6 @@ pub async fn open_paths_with_positions(
     } = cx
         .update(|cx| workspace::open_paths(&paths, app_state.clone(), open_options, cx))
         .await?;
-    cx.update(|cx| workspace::focus_requested_window(multi_workspace.into(), cx));
     if open_in_dev_container {
         multi_workspace
             .update(cx, |_, window, cx| {
@@ -798,7 +957,6 @@ pub async fn handle_cli_connection(
         mut requests,
         responses,
         first_request,
-        cli_environment: handed_off_cli_environment,
     } = connection;
     let request = match first_request {
         Some(request) => Some(request),
@@ -819,16 +977,6 @@ pub async fn handle_cli_connection(
                 dev_container,
                 cwd,
             } => {
-                let applicable_env = env
-                    .clone()
-                    .filter(|_| cli_environment_applies(&urls, &paths, &diff_paths, open_behavior));
-                let mut cli_environment = match (applicable_env, handed_off_cli_environment) {
-                    (Some(_), Some(handed_off)) => Some(handed_off),
-                    (Some(env), None) => restoration
-                        .is_some()
-                        .then(|| CliEnvironmentAssignment::new(env)),
-                    (None, _) => None,
-                };
                 if !urls.is_empty() {
                     cx.update(|cx| {
                         match OpenRequest::parse(
@@ -870,20 +1018,23 @@ pub async fn handle_cli_connection(
                     && open_behavior != cli::OpenBehavior::AlwaysNew
                     && let Some(restoration) = restoration.as_ref()
                 {
-                    let result = restore_or_create_workspace(
-                        app_state,
-                        Some(restoration.finished.clone()),
-                        cx,
-                    )
-                    .await;
-                    let status = if result.log_err().is_some() { 0 } else { 1 };
+                    restoration.any_window_restored().await;
                     cx.update(|cx| cx.activate(true));
+                    let result = restore_or_create_workspace(app_state, true, cx).await;
+                    let status = if result.log_err().is_some() { 0 } else { 1 };
                     responses.send(CliResponse::Exit { status }).log_err();
                     return;
                 }
 
-                if let Some(restoration) = restoration.as_ref() {
-                    restoration.windows_opened_for(Some(open_behavior)).await;
+                if open_behavior != cli::OpenBehavior::AlwaysNew
+                    && let Some(restoration) = restoration.as_ref()
+                {
+                    restoration
+                        .local_paths_restored(
+                            app_state.fs.clone(),
+                            cli_target_paths(&paths, &diff_paths, cwd.as_deref()),
+                        )
+                        .await;
                 }
 
                 if open_behavior == cli::OpenBehavior::Default {
@@ -892,7 +1043,6 @@ pub async fn handle_cli_connection(
                         &app_state,
                         responses.as_ref(),
                         &mut requests,
-                        &mut cli_environment,
                         cx,
                     )
                     .await
@@ -923,11 +1073,7 @@ pub async fn handle_cli_connection(
                     dev_container,
                     app_state.clone(),
                     env,
-                    cli_environment,
-                    cwd,
-                    restoration
-                        .as_ref()
-                        .is_some_and(|restoration| restoration.dedupe_restored_roots),
+                    CliOpenContext { cwd, restoration },
                     cx,
                 )
                 .await;
@@ -941,13 +1087,11 @@ pub async fn handle_cli_connection(
                 debug_panic!("unexpected SetOpenBehavior message");
             }
         }
-    } else {
-        drop(handed_off_cli_environment);
-        if let Some(restoration) = restoration {
-            restore_or_create_workspace(app_state, Some(restoration.finished), cx)
-                .await
-                .log_err();
-        }
+    } else if let Some(restoration) = restoration {
+        restoration.any_window_restored().await;
+        restore_or_create_workspace(app_state, true, cx)
+            .await
+            .log_err();
     }
 }
 
@@ -962,7 +1106,6 @@ async fn resolve_open_behavior(
     app_state: &Arc<AppState>,
     responses: &dyn CliResponseSink,
     requests: &mut mpsc::UnboundedReceiver<CliRequest>,
-    cli_environment: &mut Option<CliEnvironmentAssignment>,
     cx: &mut AsyncApp,
 ) -> Option<settings::CliDefaultOpenBehavior> {
     let has_existing_windows = cx.update(|cx| {
@@ -1023,7 +1166,6 @@ async fn resolve_open_behavior(
         return None;
     }
 
-    drop(cli_environment.take());
     responses.send(CliResponse::PromptOpenBehavior).log_err()?;
 
     if let Some(CliRequest::SetOpenBehavior { behavior }) = requests.next().await {
@@ -1105,20 +1247,6 @@ fn open_behavior_for_default_setting(cx: &App) -> cli::OpenBehavior {
     }
 }
 
-fn cli_environment_applies(
-    urls: &[String],
-    paths: &[String],
-    diff_paths: &[[String; 2]],
-    open_behavior: cli::OpenBehavior,
-) -> bool {
-    urls.is_empty()
-        && (!paths.is_empty() || !diff_paths.is_empty())
-        && !matches!(
-            open_behavior,
-            cli::OpenBehavior::AlwaysNew | cli::OpenBehavior::Reuse
-        )
-}
-
 async fn open_workspaces(
     paths: Vec<String>,
     diff_paths: Vec<[String; 2]>,
@@ -1129,16 +1257,18 @@ async fn open_workspaces(
     dev_container: bool,
     app_state: Arc<AppState>,
     env: Option<collections::HashMap<String, String>>,
-    mut cli_environment: Option<CliEnvironmentAssignment>,
-    cwd: Option<PathBuf>,
-    restoring_session: bool,
+    context: CliOpenContext,
     cx: &mut AsyncApp,
 ) -> Result<()> {
+    let restoring_session = context
+        .restoration
+        .as_ref()
+        .is_some_and(|restoration| restoration.dedupe_restored_roots);
     if paths.is_empty()
         && diff_paths.is_empty()
         && !matches!(open_behavior, cli::OpenBehavior::AlwaysNew)
     {
-        return restore_or_create_workspace(app_state, None, cx).await;
+        return restore_or_create_workspace(app_state, false, cx).await;
     }
 
     let grouped_locations: Vec<(SerializedWorkspaceLocation, PathList)> =
@@ -1169,7 +1299,14 @@ async fn open_workspaces(
                 })
             })
         };
-        return open_window.await;
+        open_window.await?;
+        if let Some(window) = cx.update(|cx| {
+            cx.active_window()
+                .and_then(|window| window.downcast::<MultiWorkspace>())
+        }) {
+            context.claim_window(window);
+        }
+        return Ok(());
     }
     // If there are paths to open, open a workspace for each grouping of paths
     let mut errored = false;
@@ -1180,7 +1317,6 @@ async fn open_workspaces(
         let open_options = workspace::OpenOptions {
             wait,
             env: env.clone(),
-            cli_environment: cli_environment.take(),
             open_in_dev_container: dev_container,
             restoring_session,
             ..base_open_options
@@ -1199,7 +1335,7 @@ async fn open_workspaces(
                     diff_paths.clone(),
                     diff_all,
                     open_options,
-                    cwd.clone(),
+                    &context,
                     responses,
                     &app_state,
                     cx,
@@ -1218,18 +1354,19 @@ async fn open_workspaces(
                             .fill_connection_options_from_settings(options)
                     });
                 }
-                cx.spawn(async move |cx| {
-                    open_remote_project(
-                        connection,
-                        workspace_paths.paths().to_vec(),
-                        app_state,
-                        open_options,
-                        cx,
-                    )
-                    .await
-                    .log_err();
-                })
-                .detach();
+                match open_remote_project(
+                    connection,
+                    workspace_paths.paths().to_vec(),
+                    app_state,
+                    open_options,
+                    cx,
+                )
+                .await
+                .log_err()
+                {
+                    Some(window) => context.claim_window(window),
+                    None => errored = true,
+                }
             }
         }
     }
@@ -1240,11 +1377,11 @@ async fn open_workspaces(
 }
 
 async fn open_local_workspace(
-    mut workspace_paths: Vec<String>,
+    workspace_paths: Vec<String>,
     diff_paths: Vec<[String; 2]>,
     diff_all: bool,
     open_options: workspace::OpenOptions,
-    cwd: Option<PathBuf>,
+    context: &CliOpenContext,
     responses: &dyn CliResponseSink,
     app_state: &Arc<AppState>,
     cx: &mut AsyncApp,
@@ -1256,12 +1393,8 @@ async fn open_local_workspace(
     // Note: must use the CLI process's cwd (forwarded via `cli_cwd`), not
     // `std::env::current_dir()`, since the Zed app process's cwd is typically
     // `/` on macOS bundles or the launch dir of an already-running instance.
-    if !user_provided_paths
-        && !diff_paths.is_empty()
-        && let Some(cwd) = cwd
-    {
-        workspace_paths.push(cwd.to_string_lossy().to_string());
-    }
+    let workspace_paths =
+        cli_workspace_paths(&workspace_paths, &diff_paths, context.cwd.as_deref());
 
     let paths_with_position =
         derive_paths_with_position(app_state.fs.as_ref(), workspace_paths).await;
@@ -1297,6 +1430,7 @@ async fn open_local_workspace(
             return true;
         }
     };
+    context.claim_window(workspace);
 
     let mut errored = false;
     let mut item_release_futures = Vec::new();
@@ -1931,6 +2065,51 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_startup_environment_applies_only_to_requested_roots(cx: &mut TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ "a.txt": "" }))
+            .await;
+        let env = collections::HashMap::from_iter([("FOO".to_string(), "bar".to_string())]);
+
+        let mut environments = Vec::new();
+        for open_behavior in [cli::OpenBehavior::Default, cli::OpenBehavior::AlwaysNew] {
+            let mut cli_request =
+                make_cli_open_request(vec![path!("/project/a.txt").to_string()], open_behavior);
+            if let CliRequest::Open {
+                env: request_env, ..
+            } = &mut cli_request
+            {
+                *request_env = Some(env.clone());
+            }
+            let (request_tx, request_rx) = mpsc::unbounded();
+            request_tx.unbounded_send(cli_request).unwrap();
+            let mut request = OpenRequest {
+                kind: Some(OpenRequestKind::CliConnection(CliConnection::new(
+                    request_rx,
+                    Box::new(DiscardResponseSink),
+                ))),
+                ..OpenRequest::default()
+            };
+            request.opens_window(&mut cx.to_async()).await;
+            let environment = request.startup_environment(fs.as_ref()).await;
+            let mut root_environments = Vec::new();
+            for root in [path!("/project"), path!("/other")] {
+                root_environments.push(match environment.as_ref() {
+                    Some(environment) => {
+                        environment
+                            .for_roots(fs.as_ref(), &[PathBuf::from(root)])
+                            .await
+                    }
+                    None => None,
+                });
+            }
+            environments.push(root_environments);
+        }
+
+        assert_eq!(environments, vec![vec![Some(env), None], vec![None, None]]);
+    }
+
+    #[gpui::test]
     fn test_parse_agent_url_with_empty_prompt(cx: &mut TestAppContext) {
         let _app_state = init_test(cx);
 
@@ -2133,7 +2312,7 @@ mod tests {
                         wait: true,
                         ..Default::default()
                     },
-                    None,
+                    &CliOpenContext::default(),
                     &response_sink,
                     &app_state,
                     &mut cx,
@@ -2253,7 +2432,7 @@ mod tests {
                     vec![],
                     false,
                     open_options,
-                    None,
+                    &CliOpenContext::default(),
                     &response_sink,
                     &app_state,
                     &mut cx,
@@ -2324,7 +2503,7 @@ mod tests {
                         vec![],
                         false,
                         workspace::OpenOptions::default(),
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2361,7 +2540,7 @@ mod tests {
                             requesting_window: Some(window_to_replace),
                             ..Default::default()
                         },
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2508,7 +2687,7 @@ mod tests {
                         Vec::new(),
                         false,
                         workspace::OpenOptions::default(),
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2536,7 +2715,7 @@ mod tests {
                             workspace_matching: workspace::WorkspaceMatching::None, // Force new window
                             ..Default::default()
                         },
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2583,7 +2762,7 @@ mod tests {
                             workspace_matching: workspace::WorkspaceMatching::MatchSubdirectory, // --add flag
                             ..Default::default()
                         },
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2648,7 +2827,7 @@ mod tests {
                             open_in_dev_container: true,
                             ..Default::default()
                         },
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,
@@ -2700,7 +2879,7 @@ mod tests {
                                 open_in_dev_container,
                                 ..workspace::OpenOptions::default()
                             },
-                            None,
+                            &CliOpenContext::default(),
                             &DiscardResponseSink,
                             &app_state,
                             &mut cx,
@@ -2756,7 +2935,7 @@ mod tests {
                             open_in_dev_container: true,
                             ..Default::default()
                         },
-                        None,
+                        &CliOpenContext::default(),
                         &response_sink,
                         &app_state,
                         &mut cx,

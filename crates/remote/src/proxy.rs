@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-#[derive(Copy, Clone, Error, Debug)]
+#[derive(Copy, Clone, Error, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum ProxyLaunchError {
     // We're using 90 as the exit code, because 0-78 are often taken
@@ -8,6 +8,8 @@ pub enum ProxyLaunchError {
     // in certain contexts.
     #[error("Attempted reconnect, but server not running.")]
     ServerNotRunning = 90,
+    #[error("A server owned by another client is running with this identifier.")]
+    ServerOwnedByAnotherClient = 91,
 }
 
 impl ProxyLaunchError {
@@ -18,6 +20,7 @@ impl ProxyLaunchError {
     pub fn from_exit_code(exit_code: i32) -> Option<Self> {
         match exit_code {
             90 => Some(Self::ServerNotRunning),
+            91 => Some(Self::ServerOwnedByAnotherClient),
             _ => None,
         }
     }

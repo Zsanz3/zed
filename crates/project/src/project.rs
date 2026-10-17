@@ -2312,26 +2312,6 @@ impl Project {
         self.environment.read(cx).get_cli_environment()
     }
 
-    pub fn set_cli_environment_if_unset(
-        &mut self,
-        cli_environment: HashMap<String, String>,
-        cx: &mut Context<Self>,
-    ) {
-        self.environment.update(cx, |environment, _| {
-            environment.set_cli_environment_if_unset(cli_environment)
-        });
-    }
-
-    pub fn set_cli_environment_gate(
-        &mut self,
-        gate: impl Future<Output = ()> + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        self.environment.update(cx, |environment, cx| {
-            environment.set_cli_environment_gate(gate, cx)
-        });
-    }
-
     #[inline]
     pub fn peek_environment_error<'a>(&'a self, cx: &'a App) -> Option<&'a String> {
         self.environment.read(cx).peek_environment_error()
@@ -3048,6 +3028,9 @@ impl Project {
             *sharing_has_stopped = true;
             self.client_subscriptions.clear();
             self.collaborators.clear();
+            self.breakpoint_store.update(cx, |breakpoint_store, _| {
+                breakpoint_store.set_collaborators([])
+            });
             self.worktree_store.update(cx, |store, cx| {
                 store.disconnected_from_host(cx);
             });
@@ -5600,7 +5583,10 @@ impl Project {
             this.buffer_store.update(cx, |buffer_store, _| {
                 buffer_store.forget_shared_buffers_for(&collaborator.peer_id);
             });
-            this.breakpoint_store.read(cx).broadcast();
+            this.breakpoint_store.update(cx, |breakpoint_store, _| {
+                breakpoint_store.collaborator_added(collaborator.peer_id);
+                breakpoint_store.broadcast();
+            });
             cx.emit(Event::CollaboratorJoined(collaborator.peer_id));
             this.collaborators
                 .insert(collaborator.peer_id, collaborator);
@@ -5633,6 +5619,9 @@ impl Project {
             log::info!("peer {} became {}", old_peer_id, new_peer_id,);
             this.buffer_store.update(cx, |buffer_store, _| {
                 buffer_store.update_peer_id(&old_peer_id, new_peer_id)
+            });
+            this.breakpoint_store.update(cx, |breakpoint_store, _| {
+                breakpoint_store.collaborator_renamed(old_peer_id, new_peer_id)
             });
 
             if is_host {
@@ -5668,6 +5657,9 @@ impl Project {
                 for buffer in buffer_store.buffers() {
                     buffer.update(cx, |buffer, cx| buffer.remove_peer(replica_id, cx));
                 }
+            });
+            this.breakpoint_store.update(cx, |breakpoint_store, _| {
+                breakpoint_store.collaborator_removed(peer_id)
             });
             this.git_store.update(cx, |git_store, _| {
                 git_store.forget_shared_diffs_for(&peer_id);
@@ -6514,6 +6506,9 @@ impl Project {
                 cx.emit(Event::CollaboratorLeft(*old_peer_id));
             }
         }
+        self.breakpoint_store.update(cx, |breakpoint_store, _| {
+            breakpoint_store.set_collaborators(collaborators.keys().copied())
+        });
         self.collaborators = collaborators;
         Ok(())
     }

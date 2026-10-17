@@ -3,6 +3,7 @@ pub mod model;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
+    ffi::OsStr,
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
@@ -19,7 +20,11 @@ use db::{
     sqlez::{connection::Connection, domain::Domain},
     sqlez_macros::sql,
 };
-use gpui::{Axis, Bounds, Entity, EntityId, Global, Task, WindowBounds, WindowId, point, size};
+use futures::future::Shared;
+use gpui::{
+    AppContext as _, Axis, Bounds, Entity, EntityId, Global, Task, WindowBounds, WindowId, point,
+    size,
+};
 use parking_lot::Mutex;
 use project::{
     ProjectGroupKey,
@@ -31,8 +36,7 @@ use project::{
 use language::{LanguageName, Toolchain, ToolchainScope};
 use remote::{
     DockerConnectionOptions, RemoteConnectionIdentity, RemoteConnectionOptions,
-    SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
-    remote_connection_target_args,
+    RemoteConnectionTarget, SshConnectionOptions, WslConnectionOptions, remote_connection_identity,
 };
 use serde::{Deserialize, Serialize};
 use sqlez::{
@@ -52,7 +56,7 @@ use crate::{
 };
 
 use model::{
-    GroupId, ItemId, PaneId, RemoteConnectionId, SerializedItem, SerializedPane,
+    GroupId, ItemId, Lenient, PaneId, RemoteConnectionId, SerializedItem, SerializedPane,
     SerializedPaneGroup, SerializedWorkspace, UnserializedRootFiles,
 };
 
@@ -71,7 +75,25 @@ fn parse_timestamp(text: &str) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-pub(crate) fn is_git_message_file(path: &Path) -> bool {
+pub(crate) async fn is_git_message_file(path: &Path, fs: &dyn Fs) -> bool {
+    if !has_git_message_file_name(path) {
+        return false;
+    }
+    let Some(mut git_directory) = path.parent() else {
+        return false;
+    };
+    if git_directory.file_name().is_some_and(|name| {
+        name == OsStr::new("rebase-merge") || name == OsStr::new("rebase-apply")
+    }) && let Some(parent) = git_directory.parent()
+    {
+        git_directory = parent;
+    }
+    fs.is_file(&git_directory.join("HEAD")).await
+        && (fs.is_dir(&git_directory.join("objects")).await
+            || fs.is_file(&git_directory.join("commondir")).await)
+}
+
+pub(crate) fn has_git_message_file_name(path: &Path) -> bool {
     const GIT_MESSAGE_FILES: [&str; 8] = [
         "COMMIT_EDITMSG",
         "MERGE_MSG",
@@ -85,12 +107,133 @@ pub(crate) fn is_git_message_file(path: &Path) -> bool {
     path.file_name()
         .and_then(|file_name| file_name.to_str())
         .is_some_and(|file_name| GIT_MESSAGE_FILES.contains(&file_name))
-        && path.ancestors().skip(1).any(|directory| {
-            directory
-                .file_name()
-                .and_then(|directory_name| directory_name.to_str())
-                .is_some_and(|directory_name| directory_name.ends_with(".git"))
+}
+
+struct WindowMember {
+    workspace_id: WorkspaceId,
+    location: SerializedWorkspaceLocation,
+    restorable_paths: PathList,
+    has_items: bool,
+}
+
+fn restores_in_own_window(sibling: &WindowMember, members: &[WindowMember]) -> bool {
+    sibling.has_items
+        && (sibling.restorable_paths.is_empty()
+            || members.iter().any(|member| {
+                member.workspace_id != sibling.workspace_id
+                    && member.location == sibling.location
+                    && member.restorable_paths.paths() == sibling.restorable_paths.paths()
+            }))
+}
+
+const CONFIGURED_SSH_CONNECTIONS_KEY: &str = "configured_connections";
+const SSH_ARGUMENT_RENAMES_KEY: &str = "argument_renames";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshArgumentRenames {
+    Keep,
+    Discard,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfiguredSshConnection {
+    pub host: String,
+    pub username: Option<String>,
+    pub port: Option<u16>,
+    pub args: Vec<String>,
+}
+
+impl ConfiguredSshConnection {
+    fn target(&self) -> SshTarget {
+        SshTarget {
+            host: self.host.clone(),
+            username: self.username.clone(),
+            port: self.port,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SshTarget {
+    host: String,
+    username: Option<String>,
+    port: Option<u16>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SshArgumentsRename {
+    target: SshTarget,
+    from: Vec<String>,
+    to: Vec<String>,
+}
+
+fn ssh_argument_edits(
+    previous: &[ConfiguredSshConnection],
+    configured: &[ConfiguredSshConnection],
+) -> Vec<SshArgumentsRename> {
+    let removed = previous
+        .iter()
+        .filter(|connection| !configured.contains(connection))
+        .collect::<Vec<_>>();
+    let added = configured
+        .iter()
+        .filter(|connection| !previous.contains(connection))
+        .collect::<Vec<_>>();
+    removed
+        .iter()
+        .filter_map(|removed_connection| {
+            let target = removed_connection.target();
+            let removed_for_target = removed
+                .iter()
+                .filter(|connection| connection.target() == target)
+                .count();
+            let mut added_for_target = added
+                .iter()
+                .filter(|connection| connection.target() == target);
+            let added_connection = added_for_target.next()?;
+            (removed_for_target == 1 && added_for_target.next().is_none()).then(|| {
+                SshArgumentsRename {
+                    target,
+                    from: removed_connection.args.clone(),
+                    to: added_connection.args.clone(),
+                }
+            })
         })
+        .collect()
+}
+
+fn compose_ssh_argument_renames(
+    mut renames: Vec<SshArgumentsRename>,
+    edits: &[SshArgumentsRename],
+    configured: &[ConfiguredSshConnection],
+) -> Vec<SshArgumentsRename> {
+    for edit in edits {
+        for existing in &mut renames {
+            if existing.target == edit.target && existing.to == edit.from {
+                existing.to = edit.to.clone();
+            }
+        }
+        renames.retain(|existing| existing.target != edit.target || existing.from != edit.from);
+        renames.push(edit.clone());
+    }
+    renames.retain(|rename| {
+        rename.from != rename.to
+            && !configured.iter().any(|connection| {
+                connection.target() == rename.target && connection.args == rename.from
+            })
+    });
+    renames
+}
+
+fn renamed_ssh_arguments(
+    renames: &[SshArgumentsRename],
+    target: &SshTarget,
+    args: &[String],
+) -> Option<Vec<String>> {
+    renames
+        .iter()
+        .find(|rename| rename.target == *target && rename.from == args)
+        .map(|rename| rename.to.clone())
 }
 
 fn contains_wsl_path(paths: &PathList) -> bool {
@@ -331,14 +474,10 @@ const PERSISTENT_ITEM_ID_EPOCH_KEY: &str = "persistent_item_id_epoch";
 const MAX_PERSISTENT_ITEM_ID_EPOCH: u32 = u32::MAX >> 1;
 
 pub fn reserve_persistent_item_ids(cx: &mut App) {
-    if cx
-        .try_global::<PersistentItemIds>()
-        .is_none_or(|ids| ids.epoch.is_none())
-    {
-        let epoch = PersistentItemIds::reserve_epoch(cx);
-        let ids = cx.default_global::<PersistentItemIds>();
-        ids.epoch = Some(epoch);
-        ids.next_index = 0;
+    let kvp = KeyValueStore::global(cx);
+    let ids = cx.default_global::<PersistentItemIds>();
+    if ids.epoch.is_none() {
+        ids.start_epoch(&kvp);
     }
 }
 
@@ -355,7 +494,7 @@ pub fn persistent_item_id<T: 'static>(entity: &Entity<T>, cx: &mut App) -> ItemI
     item_id
 }
 
-pub fn claim_persistent_item_id<T: 'static>(
+pub(crate) fn claim_persistent_item_id<T: 'static>(
     entity: &Entity<T>,
     item_id: ItemId,
     cx: &mut App,
@@ -364,9 +503,11 @@ pub fn claim_persistent_item_id<T: 'static>(
     if let Some(existing_item_id) = ids.by_entity.get(&entity.entity_id()) {
         return *existing_item_id;
     }
-    if ids.by_item.contains_key(&item_id) {
-        return persistent_item_id(entity, cx);
-    }
+    let item_id = if ids.by_item.contains_key(&item_id) {
+        PersistentItemIds::allocate(cx)
+    } else {
+        item_id
+    };
     PersistentItemIds::track(entity, item_id, cx);
     item_id
 }
@@ -407,36 +548,23 @@ impl PersistentItemIds {
     }
 
     fn allocate(cx: &mut App) -> ItemId {
+        let kvp = KeyValueStore::global(cx);
+        let ids = cx.default_global::<Self>();
         loop {
-            let item_id = Self::next_unclaimed_candidate(cx);
-            if !cx.default_global::<Self>().by_item.contains_key(&item_id) {
+            let epoch = match ids.epoch.filter(|_| ids.next_index != u32::MAX) {
+                Some(epoch) => epoch,
+                None => ids.start_epoch(&kvp),
+            };
+            let item_id = (u64::from(epoch) << 33) | u64::from(ids.next_index);
+            ids.next_index += 1;
+            if !ids.by_item.contains_key(&item_id) {
                 return item_id;
             }
         }
     }
 
-    fn next_unclaimed_candidate(cx: &mut App) -> ItemId {
-        let ids = cx.default_global::<Self>();
-        let reserved_epoch = ids.epoch.filter(|_| ids.next_index != u32::MAX);
-        let epoch = match reserved_epoch {
-            Some(epoch) => epoch,
-            None => {
-                let epoch = Self::reserve_epoch(cx);
-                let ids = cx.default_global::<Self>();
-                ids.epoch = Some(epoch);
-                ids.next_index = 0;
-                epoch
-            }
-        };
-        let ids = cx.default_global::<Self>();
-        let index = ids.next_index;
-        ids.next_index += 1;
-        (u64::from(epoch) << 33) | u64::from(index)
-    }
-
-    fn reserve_epoch(cx: &App) -> u32 {
-        let kvp = KeyValueStore::global(cx);
-        gpui::block_on(kvp.next_counter_value(
+    fn start_epoch(&mut self, kvp: &KeyValueStore) -> u32 {
+        let epoch = gpui::block_on(kvp.next_counter_value(
             PERSISTENT_ITEM_ID_EPOCH_KEY.to_string(),
             MAX_PERSISTENT_ITEM_ID_EPOCH,
         ))
@@ -445,19 +573,21 @@ impl PersistentItemIds {
             let fallback_epochs = MAX_PERSISTENT_ITEM_ID_EPOCH >> 1;
             (Uuid::new_v4().as_u64_pair().0 as u32 & fallback_epochs) | (fallback_epochs + 1)
         })
-        .clamp(1, MAX_PERSISTENT_ITEM_ID_EPOCH)
+        .clamp(1, MAX_PERSISTENT_ITEM_ID_EPOCH);
+        self.epoch = Some(epoch);
+        self.next_index = 0;
+        epoch
     }
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct RestoringItems(Arc<Mutex<HashMap<WorkspaceId, HashMap<ItemId, usize>>>>);
+pub(crate) struct RestoringItems(Arc<Mutex<HashMap<(WorkspaceId, ItemId), usize>>>);
 
 impl Global for RestoringItems {}
 
 pub(crate) struct RestoringItemsLease {
     restoring_items: RestoringItems,
-    workspace_id: WorkspaceId,
-    item_ids: Vec<ItemId>,
+    keys: Vec<(WorkspaceId, ItemId)>,
 }
 
 impl RestoringItems {
@@ -466,56 +596,131 @@ impl RestoringItems {
     }
 
     pub(crate) fn lease(&self, workspace: &SerializedWorkspace) -> RestoringItemsLease {
-        let item_ids = workspace.center_group.item_ids();
+        let keys = workspace
+            .center_group
+            .item_ids()
+            .into_iter()
+            .map(|item_id| (workspace.id, item_id))
+            .collect::<Vec<_>>();
         let mut restoring = self.0.lock();
-        let counts = restoring.entry(workspace.id).or_default();
-        for item_id in &item_ids {
-            *counts.entry(*item_id).or_default() += 1;
+        for key in &keys {
+            *restoring.entry(*key).or_default() += 1;
         }
         RestoringItemsLease {
             restoring_items: self.clone(),
-            workspace_id: workspace.id,
-            item_ids,
+            keys,
         }
     }
 
     fn item_ids(&self, workspace_id: WorkspaceId) -> Vec<ItemId> {
         self.0
             .lock()
-            .get(&workspace_id)
-            .map(|counts| counts.keys().copied().collect())
-            .unwrap_or_default()
+            .keys()
+            .filter(|(restoring_workspace_id, _)| *restoring_workspace_id == workspace_id)
+            .map(|(_, item_id)| *item_id)
+            .collect()
     }
 }
 
 impl Drop for RestoringItemsLease {
     fn drop(&mut self) {
         let mut restoring = self.restoring_items.0.lock();
-        let Some(counts) = restoring.get_mut(&self.workspace_id) else {
-            return;
-        };
-        for item_id in &self.item_ids {
-            if let Some(count) = counts.get_mut(item_id) {
-                *count = count.saturating_sub(1);
+        for key in &self.keys {
+            if let Some(count) = restoring.get_mut(key) {
+                *count -= 1;
                 if *count == 0 {
-                    counts.remove(item_id);
+                    restoring.remove(key);
                 }
             }
-        }
-        if counts.is_empty() {
-            restoring.remove(&self.workspace_id);
         }
     }
 }
 
 #[derive(Clone, Default)]
-pub struct WorkspaceIdClaims(Arc<Mutex<HashMap<WorkspaceId, usize>>>);
+pub struct WorkspaceIdClaims(Arc<Mutex<ClaimsState>>);
 
 impl Global for WorkspaceIdClaims {}
+
+#[derive(Default)]
+struct ClaimsState {
+    holders: HashMap<WorkspaceId, Holders>,
+    last_changed_at: HashMap<WorkspaceId, u64>,
+    generation: u64,
+}
+
+#[derive(Default)]
+struct Holders {
+    shared: usize,
+    exclusive: bool,
+}
+
+impl ClaimsState {
+    fn acquire(&mut self, workspace_id: WorkspaceId, exclusive: bool) {
+        let holders = self.holders.entry(workspace_id).or_default();
+        if exclusive {
+            holders.exclusive = true;
+        } else {
+            holders.shared += 1;
+        }
+        self.touch(workspace_id);
+    }
+
+    fn release(&mut self, workspace_id: WorkspaceId, exclusive: bool) {
+        if let Some(holders) = self.holders.get_mut(&workspace_id) {
+            if exclusive {
+                holders.exclusive = false;
+            } else {
+                holders.shared = holders.shared.saturating_sub(1);
+            }
+            if !holders.exclusive && holders.shared == 0 {
+                self.holders.remove(&workspace_id);
+            }
+        }
+        self.touch(workspace_id);
+    }
+
+    fn touch(&mut self, workspace_id: WorkspaceId) {
+        self.generation += 1;
+        self.last_changed_at.insert(workspace_id, self.generation);
+    }
+}
+
+#[derive(Clone)]
+pub struct ClaimsSnapshot {
+    claims: WorkspaceIdClaims,
+    generation: u64,
+}
+
+impl ClaimsSnapshot {
+    pub(crate) fn protected(&self) -> ProtectedWorkspaces<'_> {
+        ProtectedWorkspaces {
+            state: self.claims.0.lock(),
+            unchanged_since: Some(self.generation),
+        }
+    }
+}
 
 pub struct WorkspaceIdClaim {
     claims: WorkspaceIdClaims,
     workspace_id: WorkspaceId,
+    exclusive: bool,
+}
+
+pub(crate) struct ProtectedWorkspaces<'a> {
+    state: parking_lot::MutexGuard<'a, ClaimsState>,
+    unchanged_since: Option<u64>,
+}
+
+impl ProtectedWorkspaces<'_> {
+    pub(crate) fn contains(&self, workspace_id: WorkspaceId) -> bool {
+        self.state.holders.contains_key(&workspace_id)
+            || self.unchanged_since.is_some_and(|since| {
+                self.state
+                    .last_changed_at
+                    .get(&workspace_id)
+                    .is_some_and(|changed_at| *changed_at > since)
+            })
+    }
 }
 
 impl WorkspaceIdClaims {
@@ -523,32 +728,107 @@ impl WorkspaceIdClaims {
         cx.default_global::<Self>().clone()
     }
 
+    pub fn current(cx: &App) -> Self {
+        cx.try_global::<Self>().cloned().unwrap_or_default()
+    }
+
     pub fn try_claim(&self, workspace_id: WorkspaceId) -> Option<WorkspaceIdClaim> {
-        let mut claims = self.0.lock();
-        if claims.contains_key(&workspace_id) {
+        let mut state = self.0.lock();
+        if state
+            .holders
+            .get(&workspace_id)
+            .is_some_and(|holders| holders.exclusive)
+        {
             return None;
         }
-        claims.insert(workspace_id, 1);
-        drop(claims);
-        Some(WorkspaceIdClaim {
-            claims: self.clone(),
-            workspace_id,
-        })
+        state.acquire(workspace_id, true);
+        Some(self.claim(workspace_id, true))
+    }
+
+    pub(crate) fn hold(&self, workspace_id: WorkspaceId) -> WorkspaceIdClaim {
+        self.0.lock().acquire(workspace_id, false);
+        self.claim(workspace_id, false)
     }
 
     pub(crate) fn claimed(&self) -> HashSet<WorkspaceId> {
-        self.0.lock().keys().copied().collect()
+        self.0.lock().holders.keys().copied().collect()
+    }
+
+    pub fn snapshot(&self) -> ClaimsSnapshot {
+        ClaimsSnapshot {
+            claims: self.clone(),
+            generation: self.0.lock().generation,
+        }
+    }
+
+    pub(crate) fn protected(&self) -> ProtectedWorkspaces<'_> {
+        ProtectedWorkspaces {
+            state: self.0.lock(),
+            unchanged_since: None,
+        }
+    }
+
+    fn claim(&self, workspace_id: WorkspaceId, exclusive: bool) -> WorkspaceIdClaim {
+        WorkspaceIdClaim {
+            claims: self.clone(),
+            workspace_id,
+            exclusive,
+        }
     }
 }
 
 impl Drop for WorkspaceIdClaim {
     fn drop(&mut self) {
-        let mut claims = self.claims.0.lock();
-        if let Some(count) = claims.get_mut(&self.workspace_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                claims.remove(&self.workspace_id);
+        self.claims
+            .0
+            .lock()
+            .release(self.workspace_id, self.exclusive);
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct WorkspaceWrites(Arc<Mutex<HashMap<WorkspaceId, Shared<Task<()>>>>>);
+
+impl Global for WorkspaceWrites {}
+
+impl WorkspaceWrites {
+    pub(crate) fn global(cx: &mut App) -> Self {
+        cx.default_global::<Self>().clone()
+    }
+
+    pub(crate) fn last(&self, workspace_id: WorkspaceId) -> Option<Shared<Task<()>>> {
+        self.0
+            .lock()
+            .get(&workspace_id)
+            .filter(|write| write.peek().is_none())
+            .cloned()
+    }
+
+    pub(crate) fn record(&self, workspace_id: WorkspaceId, write: Shared<Task<()>>) {
+        let mut writes = self.0.lock();
+        writes.retain(|_, write| write.peek().is_none());
+        writes.insert(workspace_id, write);
+    }
+
+    pub(crate) async fn settled(&self, workspace_id: WorkspaceId) {
+        while let Some(write) = self.last(workspace_id) {
+            write.await;
+        }
+    }
+
+    pub(crate) async fn all_settled(&self) {
+        loop {
+            let pending = self
+                .0
+                .lock()
+                .values()
+                .filter(|write| write.peek().is_none())
+                .cloned()
+                .collect::<Vec<_>>();
+            if pending.is_empty() {
+                return;
             }
+            futures::future::join_all(pending).await;
         }
     }
 }
@@ -609,14 +889,37 @@ fn multi_workspace_state_key(session_id: &str, window_id: WindowId) -> String {
 }
 
 const MULTI_WORKSPACE_STATE_KEY_SEPARATOR: &str = ":";
-const RESTORE_FAILURES_NAMESPACE: &str = "workspace_restore_failures";
-const UNAVAILABLE_SINCE_NAMESPACE: &str = "session_workspace_unavailable_since";
+
 const UNAVAILABLE_SESSION_WORKSPACE_RETENTION: chrono::Duration = chrono::Duration::days(7);
 const MAX_RESTORE_ATTEMPTS: u32 = 2;
+const LOCKED_RETRIES: usize = 100;
+const LOCKED_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
 
 fn parse_multi_workspace_state_key(key: &str) -> Option<(&str, u64)> {
     let (session_id, window_id) = key.rsplit_once(MULTI_WORKSPACE_STATE_KEY_SEPARATOR)?;
     Some((session_id, window_id.parse().ok()?))
+}
+
+fn retry_table_locks<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    let mut attempt = 0;
+    loop {
+        match operation() {
+            Err(error) if attempt < LOCKED_RETRIES && is_table_lock_error(&error) => {
+                attempt += 1;
+                std::thread::sleep(LOCKED_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_table_lock_error(error: &anyhow::Error) -> bool {
+    format!("{error:#}").contains("database table is locked")
+}
+
+fn lossy_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
 }
 
 fn multi_workspace_state_key_prefix(session_id: &str) -> String {
@@ -626,7 +929,9 @@ fn multi_workspace_state_key_prefix(session_id: &str) -> String {
 pub fn read_serialized_multi_workspaces(
     session_workspaces: Vec<model::SessionWorkspace>,
     cx: &App,
-) -> Vec<model::SerializedMultiWorkspace> {
+) -> Task<Vec<model::SerializedMultiWorkspace>> {
+    let db = WorkspaceDb::global(cx);
+    let mut detached_from_windows = Vec::new();
     let mut window_groups: Vec<Vec<model::SessionWorkspace>> = Vec::new();
     let mut window_id_to_group: HashMap<(Option<String>, WindowId), usize> = HashMap::default();
 
@@ -647,9 +952,9 @@ pub fn read_serialized_multi_workspaces(
         }
     }
 
-    window_groups
+    let windows = window_groups
         .into_iter()
-        .filter_map(|group| {
+        .flat_map(|group| {
             let state = group
                 .first()
                 .and_then(|session_workspace| {
@@ -660,7 +965,7 @@ pub fn read_serialized_multi_workspaces(
                     ))
                 })
                 .unwrap_or_default();
-            let active_workspace = state
+            let active_index = state
                 .active_workspace_id
                 .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
                 // If the persisted active workspace can't be matched (e.g. its
@@ -670,14 +975,56 @@ pub fn read_serialized_multi_workspaces(
                 // restored as the focused window. Only if none have paths do we
                 // fall back to the first entry.
                 .or_else(|| group.iter().position(|ws| !ws.paths.is_empty()))
-                .or(Some(0))
-                .and_then(|index| group.into_iter().nth(index))?;
-            Some(model::SerializedMultiWorkspace {
-                active_workspace,
-                state,
-            })
+                .unwrap_or(0);
+            let members = group
+                .iter()
+                .map(|member| WindowMember {
+                    workspace_id: member.workspace_id,
+                    location: member.location.clone(),
+                    restorable_paths: member.paths.clone(),
+                    has_items: db
+                        .workspace_has_items(member.workspace_id)
+                        .log_err()
+                        .flatten()
+                        .unwrap_or(false),
+                })
+                .collect::<Vec<_>>();
+            let mut windows = Vec::new();
+            let mut active_workspace = None;
+            for (index, (mut session_workspace, member)) in
+                group.into_iter().zip(&members).enumerate()
+            {
+                if index == active_index {
+                    active_workspace = Some(session_workspace);
+                } else if restores_in_own_window(member, &members) {
+                    if session_workspace.window_id.is_some() {
+                        detached_from_windows
+                            .push((session_workspace.workspace_id, session_workspace.binding()));
+                        session_workspace.window_id = None;
+                    }
+                    windows.push(model::SerializedMultiWorkspace {
+                        active_workspace: session_workspace,
+                        state: model::MultiWorkspaceState::default(),
+                    });
+                }
+            }
+            windows.extend(active_workspace.map(|active_workspace| {
+                model::SerializedMultiWorkspace {
+                    active_workspace,
+                    state,
+                }
+            }));
+            windows
         })
-        .collect()
+        .collect::<Vec<_>>();
+    cx.background_spawn(async move {
+        if !detached_from_windows.is_empty() {
+            db.detach_from_session_windows(detached_from_windows)
+                .await
+                .log_err();
+        }
+        windows
+    })
 }
 
 const DEFAULT_DOCK_STATE_KEY: &str = "default_dock_state";
@@ -1409,6 +1756,51 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE items ADD COLUMN unrestored_since INTEGER;
         ),
+        sql!(
+            ALTER TABLE items DROP COLUMN unrestored_since;
+            ALTER TABLE workspaces ADD COLUMN restore_failures INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE workspaces ADD COLUMN roots_unavailable_since INTEGER;
+        ),
+        sql!(
+            CREATE TABLE remote_unavailable_roots(
+                workspace_id INTEGER NOT NULL,
+                root BLOB NOT NULL,
+                since INTEGER NOT NULL,
+                PRIMARY KEY(workspace_id, root),
+                FOREIGN KEY(workspace_id) REFERENCES workspaces(workspace_id)
+                ON DELETE CASCADE
+                ON UPDATE CASCADE
+            ) STRICT;
+        ),
+        sql!(
+            CREATE TABLE ssh_connection_settings(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            ) STRICT;
+        ),
+        sql!(
+            ALTER TABLE remote_unavailable_roots RENAME TO unavailable_roots;
+            WITH RECURSIVE split(workspace_id, since, root, rest) AS (
+                SELECT workspace_id, roots_unavailable_since, NULL, paths || CHAR(10)
+                FROM workspaces
+                WHERE roots_unavailable_since IS NOT NULL
+                    AND remote_connection_id IS NULL
+                    AND (length(paths) > 0)
+                UNION ALL
+                SELECT
+                    workspace_id,
+                    since,
+                    substr(rest, 1, instr(rest, CHAR(10)) - 1),
+                    substr(rest, instr(rest, CHAR(10)) + 1)
+                FROM split
+                WHERE length(rest) > 0
+            )
+            INSERT OR IGNORE INTO unavailable_roots(workspace_id, root, since)
+            SELECT workspace_id, CAST(root AS BLOB), since
+            FROM split
+            WHERE length(root) > 0;
+            ALTER TABLE workspaces DROP COLUMN roots_unavailable_since;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1436,69 +1828,124 @@ impl WorkspaceDb {
     pub(crate) fn remote_workspace_for_roots<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
-        remote_project_id: RemoteConnectionId,
+        remote_connection_ids: &[RemoteConnectionId],
     ) -> Option<SerializedWorkspace> {
-        self.workspace_for_roots_internal(worktree_roots, Some(remote_project_id))
+        self.workspace_for_roots_internal(worktree_roots, Some(remote_connection_ids))
     }
 
     pub(crate) fn workspace_for_roots_internal<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
-        remote_connection_id: Option<RemoteConnectionId>,
+        remote_connection_ids: Option<&[RemoteConnectionId]>,
     ) -> Option<SerializedWorkspace> {
-        self.workspace_ids_for_roots(worktree_roots, remote_connection_id)
+        Self::workspace_ids_for_roots(self, &PathList::new(worktree_roots), remote_connection_ids)
+            .log_err()
+            .unwrap_or_default()
             .into_iter()
             .find_map(|workspace_id| self.workspace_for_id(workspace_id))
     }
 
-    pub(crate) fn claim_workspace_for_roots<P: AsRef<Path>>(
+    pub(crate) async fn claim_settled_workspace_for_roots<P: AsRef<Path>>(
         &self,
         worktree_roots: &[P],
-        remote_connection_id: Option<RemoteConnectionId>,
-        claims: &WorkspaceIdClaims,
-        live_workspace_ids: &HashSet<WorkspaceId>,
-    ) -> Option<(SerializedWorkspace, WorkspaceIdClaim)> {
-        self.workspace_ids_for_roots(worktree_roots, remote_connection_id)
-            .into_iter()
-            .filter(|workspace_id| !live_workspace_ids.contains(workspace_id))
-            .find_map(|workspace_id| {
-                let claim = claims.try_claim(workspace_id)?;
-                Some((self.workspace_for_id(workspace_id)?, claim))
-            })
-    }
-
-    fn workspace_ids_for_roots<P: AsRef<Path>>(
-        &self,
-        worktree_roots: &[P],
-        remote_connection_id: Option<RemoteConnectionId>,
-    ) -> Vec<WorkspaceId> {
+        remote_connection_ids: Option<&[RemoteConnectionId]>,
+        mut claim_unopened: impl FnMut(WorkspaceId) -> Option<WorkspaceIdClaim>,
+        writes: &WorkspaceWrites,
+    ) -> Result<Option<(SerializedWorkspace, WorkspaceIdClaim)>> {
         // paths are sorted before db interactions to ensure that the order of the paths
         // doesn't affect the workspace selection for existing workspaces
         let root_paths = PathList::new(worktree_roots);
+        let workspace_ids = self
+            .write({
+                let root_paths = root_paths.clone();
+                let remote_connection_ids = remote_connection_ids.map(<[_]>::to_vec);
+                move |conn| {
+                    retry_table_locks(|| {
+                        Self::workspace_ids_for_roots(
+                            conn,
+                            &root_paths,
+                            remote_connection_ids.as_deref(),
+                        )
+                    })
+                }
+            })
+            .await?;
+        for workspace_id in workspace_ids {
+            let Some(claim) = claim_unopened(workspace_id) else {
+                continue;
+            };
+            if let Some(workspace) = self
+                .settled_workspace_for_id(workspace_id, writes)
+                .await?
+                .filter(|workspace| workspace.paths.paths() == root_paths.paths())
+            {
+                return Ok(Some((workspace, claim)));
+            }
+        }
+        Ok(None)
+    }
 
+    pub(crate) async fn settled_workspace_for_id(
+        &self,
+        workspace_id: WorkspaceId,
+        writes: &WorkspaceWrites,
+    ) -> Result<Option<SerializedWorkspace>> {
+        writes.settled(workspace_id).await;
+        self.read_workspace_for_id(workspace_id).await
+    }
+
+    fn workspace_ids_for_roots(
+        conn: &Connection,
+        root_paths: &PathList,
+        remote_connection_ids: Option<&[RemoteConnectionId]>,
+    ) -> Result<Vec<WorkspaceId>> {
         // Empty workspaces cannot be matched by paths (all empty workspaces have paths = "").
         // They should only be restored via workspace_for_id during session restoration.
-        if root_paths.is_empty() && remote_connection_id.is_none() {
-            return Vec::new();
+        if root_paths.is_empty() {
+            return Ok(Vec::new());
         }
 
-        self.select_bound::<(String, Option<i32>), WorkspaceId>(sql! {
-            SELECT workspace_id
-            FROM workspaces
-            WHERE
-                paths IS ? AND
-                remote_connection_id IS ?
-            ORDER BY timestamp DESC, workspace_id DESC
-        })
-        .and_then(|mut prepared_statement| {
-            (prepared_statement)((
-                root_paths.serialize().paths,
-                remote_connection_id.map(|id| id.0 as i32),
-            ))
+        maybe!({
+            let remote_connection_ids = match remote_connection_ids {
+                Some(remote_connection_ids) => {
+                    remote_connection_ids.iter().copied().map(Some).collect()
+                }
+                None => vec![None],
+            };
+            let mut select_workspaces = conn
+                .select_bound::<(String, Option<i32>), (WorkspaceId, Lenient<Option<String>>)>(
+                    sql! {
+                        SELECT workspace_id, timestamp
+                        FROM workspaces
+                        WHERE
+                            paths IS ? AND
+                            remote_connection_id IS ?
+                    },
+                )?;
+            let mut workspaces = Vec::new();
+            for remote_connection_id in remote_connection_ids {
+                workspaces.extend(
+                    select_workspaces((
+                        root_paths.serialize().paths,
+                        remote_connection_id.map(|id: RemoteConnectionId| id.0 as i32),
+                    ))?
+                    .into_iter()
+                    .map(|(workspace_id, timestamp)| (workspace_id, timestamp.0.flatten())),
+                );
+            }
+            workspaces.sort_by(|(left_id, left_timestamp), (right_id, right_timestamp)| {
+                right_timestamp
+                    .cmp(left_timestamp)
+                    .then_with(|| i64::from(*right_id).cmp(&i64::from(*left_id)))
+            });
+            anyhow::Ok(
+                workspaces
+                    .into_iter()
+                    .map(|(workspace_id, _)| workspace_id)
+                    .collect(),
+            )
         })
         .context("Looking up workspaces by roots")
-        .log_err()
-        .unwrap_or_default()
     }
 
     /// Returns the workspace with the given ID, loading all associated data.
@@ -1506,7 +1953,22 @@ impl WorkspaceDb {
         &self,
         workspace_id: WorkspaceId,
     ) -> Option<SerializedWorkspace> {
-        let (
+        Self::read_workspace(self, workspace_id).log_err().flatten()
+    }
+
+    pub(crate) async fn read_workspace_for_id(
+        &self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SerializedWorkspace>> {
+        self.write(move |conn| retry_table_locks(|| Self::read_workspace(conn, workspace_id)))
+            .await
+    }
+
+    fn read_workspace(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<SerializedWorkspace>> {
+        let Some((
             paths,
             paths_order,
             identity_paths,
@@ -1517,19 +1979,19 @@ impl WorkspaceDb {
             docks,
             window_id,
             remote_connection_id,
-        ): (
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            Option<SerializedWindowBounds>,
-            Option<Uuid>,
-            Option<bool>,
-            DockStructure,
-            Option<u64>,
-            Option<i32>,
-        ) = self
-            .select_row_bound(sql! {
+        )) = conn
+            .select_row_bound::<WorkspaceId, (
+                Vec<u8>,
+                Vec<u8>,
+                Option<Vec<u8>>,
+                Option<Vec<u8>>,
+                Lenient<Option<SerializedWindowBounds>>,
+                Lenient<Option<Uuid>>,
+                Option<bool>,
+                DockStructure,
+                Option<u64>,
+                Option<i32>,
+            )>(sql! {
                 SELECT
                     paths,
                     paths_order,
@@ -1557,181 +2019,181 @@ impl WorkspaceDb {
                 WHERE workspace_id = ?
             })
             .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))
-            .context("No workspace found for id")
-            .warn_on_err()
-            .flatten()?;
+            .with_context(|| format!("Reading workspace {workspace_id:?}"))?
+        else {
+            return Ok(None);
+        };
 
         let paths = PathList::deserialize(&SerializedPathList {
-            paths,
-            order: paths_order,
+            paths: lossy_text(paths),
+            order: lossy_text(paths_order),
         });
         let identity_paths = identity_paths.map(|paths| {
             PathList::deserialize(&SerializedPathList {
-                paths,
-                order: identity_paths_order.unwrap_or_default(),
+                paths: lossy_text(paths),
+                order: identity_paths_order.map(lossy_text).unwrap_or_default(),
             })
         });
 
         let remote_connection_id = remote_connection_id.map(|id| RemoteConnectionId(id as u64));
-        let remote_connection_options = if let Some(remote_connection_id) = remote_connection_id {
-            self.remote_connection(remote_connection_id)
-                .context("Get remote connection")
-                .log_err()
-        } else {
-            None
+        let location = match remote_connection_id {
+            Some(remote_connection_id) => SerializedWorkspaceLocation::Remote(
+                Self::read_remote_connection(conn, remote_connection_id).with_context(|| {
+                    format!("Reading the remote connection of workspace {workspace_id:?}")
+                })?,
+            ),
+            None => SerializedWorkspaceLocation::Local,
         };
 
-        Some(SerializedWorkspace {
+        Ok(Some(SerializedWorkspace {
             id: workspace_id,
-            location: match remote_connection_options {
-                Some(options) => SerializedWorkspaceLocation::Remote(options),
-                None => SerializedWorkspaceLocation::Local,
-            },
+            location,
             paths,
             identity_paths,
-            center_group: self
-                .get_center_pane_group(workspace_id)
-                .context("Getting center group")
-                .log_err()?,
-            window_bounds,
+            center_group: Self::get_center_pane_group(conn, workspace_id)
+                .context("Getting center group")?,
+            window_bounds: window_bounds.0.flatten(),
             centered_layout: centered_layout.unwrap_or(false),
-            display,
+            display: display.0.flatten(),
             docks,
             session_id: None,
-            bookmarks: self.bookmarks(workspace_id),
-            breakpoints: self.breakpoints(workspace_id),
+            bookmarks: Self::bookmarks(conn, workspace_id)?,
+            breakpoints: Self::breakpoints(conn, workspace_id)?,
             window_id,
-            user_toolchains: self.user_toolchains(workspace_id, remote_connection_id),
-            recent_navigation_history: self.recent_navigation_history(workspace_id),
-            unserialized_root_files: self.unserialized_root_files(workspace_id),
-        })
+            user_toolchains: Self::user_toolchains(conn, workspace_id, remote_connection_id)?,
+            recent_navigation_history: Self::recent_navigation_history(conn, workspace_id)?,
+            unserialized_root_files: Self::unserialized_root_files(conn, workspace_id)?,
+        }))
     }
 
-    fn unserialized_root_files(&self, workspace_id: WorkspaceId) -> Option<UnserializedRootFiles> {
-        let (paths, active) = self
-            .select_row_bound::<WorkspaceId, (Option<String>, Option<PathBuf>)>(sql!(
-                SELECT unserialized_root_files, active_unserialized_root_file
-                FROM workspaces
-                WHERE workspace_id = ?
-            ))
+    fn unserialized_root_files(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<Option<UnserializedRootFiles>> {
+        let Some((paths, active)) = conn
+            .select_row_bound::<WorkspaceId, (Lenient<Option<String>>, Lenient<Option<PathBuf>>)>(
+                sql!(
+                    SELECT unserialized_root_files, active_unserialized_root_file
+                    FROM workspaces
+                    WHERE workspace_id = ?
+                ),
+            )
             .and_then(|mut statement| statement(workspace_id))
-            .context("Loading unserialized root files")
-            .log_err()
-            .flatten()?;
-        Some(UnserializedRootFiles {
+            .context("Loading unserialized root files")?
+        else {
+            return Ok(None);
+        };
+        Ok(paths.0.flatten().map(|paths| UnserializedRootFiles {
             paths: PathList::deserialize(&SerializedPathList {
-                paths: paths?,
+                paths,
                 order: String::new(),
             }),
-            active,
-        })
+            active: active.0.flatten(),
+        }))
     }
 
-    fn recent_navigation_history(&self, workspace_id: WorkspaceId) -> Vec<PathBuf> {
-        self.select_bound(sql!(
-            SELECT path
-            FROM recent_navigation_history
-            WHERE workspace_id = ?
-            ORDER BY position
-        ))
-        .and_then(|mut statement| statement(workspace_id))
-        .context("Loading recent navigation history")
-        .log_err()
-        .unwrap_or_default()
+    fn recent_navigation_history(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<PathBuf>> {
+        Ok(conn
+            .select_bound::<WorkspaceId, Lenient<PathBuf>>(sql!(
+                SELECT path
+                FROM recent_navigation_history
+                WHERE workspace_id = ?
+                ORDER BY position
+            ))
+            .and_then(|mut statement| statement(workspace_id))
+            .context("Loading recent navigation history")?
+            .into_iter()
+            .filter_map(|path| path.0)
+            .collect())
     }
 
-    fn bookmarks(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SerializedBookmark>> {
-        let bookmarks: Result<Vec<(PathBuf, Bookmark)>> = self
-            .select_bound(sql! {
+    fn bookmarks(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<BTreeMap<Arc<Path>, Vec<SerializedBookmark>>> {
+        let bookmarks = conn
+            .select_bound::<WorkspaceId, (Lenient<PathBuf>, Lenient<Bookmark>)>(sql! {
                 SELECT path, row, label
                 FROM bookmarks
                 WHERE workspace_id = ?
                 ORDER BY path, row
             })
-            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
-
-        match bookmarks {
-            Ok(bookmarks) => {
-                if bookmarks.is_empty() {
-                    log::debug!("Bookmarks are empty after querying database for them");
-                }
-
-                let mut map: BTreeMap<_, Vec<_>> = BTreeMap::default();
-
-                for (path, bookmark) in bookmarks {
-                    let path: Arc<Path> = path.into();
-                    map.entry(path.clone())
-                        .or_default()
-                        .push(SerializedBookmark {
-                            row: bookmark.row,
-                            label: bookmark.label,
-                        })
-                }
-
-                map
-            }
-            Err(e) => {
-                log::error!("Failed to load bookmarks: {}", e);
-                BTreeMap::default()
-            }
+            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))
+            .context("Loading bookmarks")?;
+        if bookmarks.is_empty() {
+            log::debug!("Bookmarks are empty after querying database for them");
         }
+
+        let mut map = BTreeMap::<Arc<Path>, Vec<SerializedBookmark>>::default();
+        for (path, bookmark) in bookmarks {
+            let (Some(path), Some(bookmark)) = (path.0, bookmark.0) else {
+                continue;
+            };
+            map.entry(Arc::from(path))
+                .or_default()
+                .push(SerializedBookmark {
+                    row: bookmark.row,
+                    label: bookmark.label,
+                });
+        }
+        Ok(map)
     }
 
-    fn breakpoints(&self, workspace_id: WorkspaceId) -> BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> {
-        let breakpoints: Result<Vec<(PathBuf, Breakpoint)>> = self
-            .select_bound(sql! {
+    fn breakpoints(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>> {
+        let breakpoints = conn
+            .select_bound::<WorkspaceId, (Lenient<PathBuf>, Lenient<Breakpoint>)>(sql! {
                 SELECT path, breakpoint_location, log_message, condition, hit_condition, state
                 FROM breakpoints
                 WHERE workspace_id = ?
             })
-            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id));
-
-        match breakpoints {
-            Ok(bp) => {
-                if bp.is_empty() {
-                    log::debug!("Breakpoints are empty after querying database for them");
-                }
-
-                let mut map: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> = Default::default();
-
-                for (path, breakpoint) in bp {
-                    let path: Arc<Path> = path.into();
-                    map.entry(path.clone()).or_default().push(SourceBreakpoint {
-                        row: breakpoint.position,
-                        path,
-                        message: breakpoint.message,
-                        condition: breakpoint.condition,
-                        hit_condition: breakpoint.hit_condition,
-                        state: breakpoint.state,
-                    });
-                }
-
-                for (path, bps) in map.iter() {
-                    log::info!(
-                        "Got {} breakpoints from database at path: {}",
-                        bps.len(),
-                        path.to_string_lossy()
-                    );
-                }
-
-                map
-            }
-            Err(msg) => {
-                log::error!("Breakpoints query failed with msg: {msg}");
-                Default::default()
-            }
+            .and_then(|mut prepared_statement| (prepared_statement)(workspace_id))
+            .context("Loading breakpoints")?;
+        if breakpoints.is_empty() {
+            log::debug!("Breakpoints are empty after querying database for them");
         }
+
+        let mut map = BTreeMap::<Arc<Path>, Vec<SourceBreakpoint>>::default();
+        for (path, breakpoint) in breakpoints {
+            let (Some(path), Some(breakpoint)) = (path.0, breakpoint.0) else {
+                continue;
+            };
+            let path = Arc::<Path>::from(path);
+            map.entry(path.clone()).or_default().push(SourceBreakpoint {
+                row: breakpoint.position,
+                path,
+                message: breakpoint.message,
+                condition: breakpoint.condition,
+                hit_condition: breakpoint.hit_condition,
+                state: breakpoint.state,
+            });
+        }
+
+        for (path, bps) in map.iter() {
+            log::info!(
+                "Got {} breakpoints from database at path: {}",
+                bps.len(),
+                path.to_string_lossy()
+            );
+        }
+
+        Ok(map)
     }
 
     fn user_toolchains(
-        &self,
+        conn: &Connection,
         workspace_id: WorkspaceId,
         remote_connection_id: Option<RemoteConnectionId>,
-    ) -> BTreeMap<ToolchainScope, IndexSet<Toolchain>> {
+    ) -> Result<BTreeMap<ToolchainScope, IndexSet<Toolchain>>> {
         type RowKind = (WorkspaceId, String, String, String, String, String, String);
 
-        let toolchains: Vec<RowKind> = self
-            .select_bound(sql! {
+        let toolchains = conn
+            .select_bound::<(Option<u64>, WorkspaceId), Lenient<RowKind>>(sql! {
                 SELECT workspace_id, worktree_root_path, relative_worktree_path,
                 language_name, name, path, raw_json
                 FROM user_toolchains WHERE remote_connection_id IS ?1 AND (
@@ -1741,7 +2203,7 @@ impl WorkspaceDb {
             .and_then(|mut statement| {
                 (statement)((remote_connection_id.map(|id| id.0), workspace_id))
             })
-            .unwrap_or_default();
+            .context("Loading user toolchains")?;
         let mut ret = BTreeMap::<_, IndexSet<_>>::default();
 
         for (
@@ -1752,7 +2214,7 @@ impl WorkspaceDb {
             name,
             path,
             raw_json,
-        ) in toolchains
+        ) in toolchains.into_iter().filter_map(|toolchain| toolchain.0)
         {
             // INTEGER's that are primary keys (like workspace ids, remote connection ids and such) start at 1, so we're safe to
             let scope = if _workspace_id == WorkspaceId(0) {
@@ -1793,25 +2255,27 @@ impl WorkspaceDb {
             ret.entry(scope).or_default().insert(toolchain);
         }
 
-        ret
+        Ok(ret)
     }
 
     #[cfg(test)]
     pub(crate) async fn save_workspace(&self, workspace: SerializedWorkspace) {
-        self.save_workspace_adopting(workspace, None, HashSet::default())
+        self.save_workspace_adopting(workspace, None, WorkspaceIdClaims::default())
             .await
+            .log_err();
     }
 
     pub(crate) async fn save_workspace_adopting(
         &self,
         workspace: SerializedWorkspace,
         adopting: Option<SessionWindow>,
-        protected_workspace_ids: HashSet<WorkspaceId>,
-    ) {
+        claims: WorkspaceIdClaims,
+    ) -> Result<()> {
         let paths = workspace.paths.serialize();
         let identity_paths = workspace.identity_paths.map(|paths| paths.serialize());
         log::debug!("Saving workspace at location: {:?}", workspace.location);
         self.write(move |conn| {
+            let protected = claims.protected();
             conn.with_savepoint("update_worktrees", || {
                 let remote_connection_id = match workspace.location.clone() {
                     SerializedWorkspaceLocation::Local => None,
@@ -1911,7 +2375,11 @@ impl WorkspaceDb {
                             workspace_id != ?1 AND
                             paths IS ?2 AND
                             remote_connection_id IS ?3 AND
-                            session_id IS NULL
+                            session_id IS NULL AND
+                            NOT EXISTS(
+                                SELECT item_id FROM items
+                                WHERE items.workspace_id = workspaces.workspace_id
+                            )
                     ))?((
                         workspace.id,
                         paths.paths.clone(),
@@ -1922,20 +2390,25 @@ impl WorkspaceDb {
                         DELETE FROM workspaces WHERE workspace_id = ?
                     ))?;
                     for stale_workspace_id in stale_workspace_ids {
-                        if !protected_workspace_ids.contains(&stale_workspace_id) {
+                        if !protected.contains(stale_workspace_id) {
                             delete_workspace(stale_workspace_id)
                                 .context("clearing out old locations")?;
                         }
                     }
                 }
 
-                if let Some((origin, session_id, window_id)) = adopting
-                    .as_ref()
-                    .zip(workspace.session_id.as_deref())
-                    .zip(workspace.window_id)
-                    .map(|((origin, session_id), window_id)| (origin, session_id, window_id))
+                if let Some(origin) = &adopting
+                    && let Some(session_id) = workspace.session_id.as_deref()
+                    && let Some(window_id) = workspace.window_id
                 {
-                    Self::adopt_session_window(conn, workspace.id, origin, session_id, window_id)?;
+                    Self::adopt_session_window(
+                        conn,
+                        workspace.id,
+                        origin,
+                        session_id,
+                        window_id,
+                        &protected,
+                    )?;
                 }
 
                 // Upsert
@@ -2026,11 +2499,11 @@ impl WorkspaceDb {
 
                 Ok(())
             })
-            .log_err();
         })
-        .await;
+        .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn get_or_create_remote_connection(
         &self,
         options: RemoteConnectionOptions,
@@ -2039,14 +2512,40 @@ impl WorkspaceDb {
             .await
     }
 
+    pub(crate) async fn equivalent_remote_connections(
+        &self,
+        options: RemoteConnectionOptions,
+    ) -> Result<Vec<RemoteConnectionId>> {
+        self.write(move |conn| {
+            retry_table_locks(|| {
+                let remote_connection_id =
+                    Self::get_or_create_remote_connection_internal(conn, options.clone())?;
+                Self::equivalent_remote_connection_ids(conn, remote_connection_id)
+            })
+        })
+        .await
+    }
+
     fn get_or_create_remote_connection_internal(
         this: &Connection,
         options: RemoteConnectionOptions,
     ) -> Result<RemoteConnectionId> {
         let identity = remote_connection_identity(&options);
-        let args = remote_connection_target_args(&options)
-            .map(serde_json::to_string)
-            .transpose()?;
+        let args = match &options {
+            RemoteConnectionOptions::Ssh(ssh_options) => {
+                let args = ssh_options.args.clone().unwrap_or_default();
+                let target = SshTarget {
+                    host: ssh_options.host.to_string(),
+                    username: ssh_options.username.clone(),
+                    port: ssh_options.port,
+                };
+                let args =
+                    renamed_ssh_arguments(&Self::ssh_argument_renames(this)?, &target, &args)
+                        .unwrap_or(args);
+                Some(serde_json::to_string(&args)?)
+            }
+            _ => None,
+        };
         let kind;
         let user: Option<String>;
         let mut host = None;
@@ -2088,9 +2587,9 @@ impl WorkspaceDb {
             }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionIdentity::Mock { id } => {
-                kind = RemoteConnectionKind::Ssh;
-                host = Some(format!("mock-{}", id));
-                user = Some(format!("mock-user-{}", id));
+                kind = RemoteConnectionKind::Mock;
+                host = Some(id.to_string());
+                user = None;
             }
         }
 
@@ -2127,7 +2626,7 @@ impl WorkspaceDb {
         remote_env: Option<String>,
         args: Option<String>,
     ) -> Result<RemoteConnectionId> {
-        let mut find_connection = this.select_row_bound::<_, u64>(sql!(
+        let existing = this.select_row_bound::<_, u64>(sql!(
             SELECT id
             FROM remote_connections
             WHERE
@@ -2141,8 +2640,7 @@ impl WorkspaceDb {
                 args IS ?
             ORDER BY id
             LIMIT 1
-        ))?;
-        let target = (
+        ))?((
             kind.serialize(),
             host.clone(),
             port,
@@ -2150,16 +2648,9 @@ impl WorkspaceDb {
             distro.clone(),
             name.clone(),
             container_id.clone(),
-        );
-        if let Some(id) = find_connection((target.clone(), args.clone()))? {
-            return Ok(RemoteConnectionId(id));
-        }
-        if args.is_some()
-            && let Some(id) = find_connection((target, None::<String>))?
-        {
-            this.exec_bound::<(Option<String>, u64)>(sql!(
-                UPDATE remote_connections SET args = ?1 WHERE id = ?2
-            ))?((args, id))?;
+            args.clone(),
+        ))?;
+        if let Some(id) = existing {
             return Ok(RemoteConnectionId(id));
         }
         let id = this.select_row_bound(sql!(
@@ -2192,10 +2683,181 @@ impl WorkspaceDb {
         Ok(RemoteConnectionId(id))
     }
 
-    query! {
-        pub async fn next_id() -> Result<WorkspaceId> {
-            INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id
+    fn equivalent_remote_connection_ids(
+        this: &Connection,
+        remote_connection_id: RemoteConnectionId,
+    ) -> Result<Vec<RemoteConnectionId>> {
+        let connections = Self::remote_connection_rows(this)?;
+        let Some(target) = connections
+            .get(&remote_connection_id)
+            .map(RemoteConnectionTarget::from)
+        else {
+            return Ok(vec![remote_connection_id]);
+        };
+        let mut equivalent_ids = connections
+            .iter()
+            .filter(|(id, options)| {
+                **id != remote_connection_id && RemoteConnectionTarget::from(*options) == target
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        equivalent_ids.sort_by_key(|id| id.0);
+        equivalent_ids.insert(0, remote_connection_id);
+        Ok(equivalent_ids)
+    }
+
+    pub async fn sync_ssh_connections(
+        &self,
+        configured: Vec<ConfiguredSshConnection>,
+        renames_from_previous_runs: SshArgumentRenames,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            conn.with_savepoint("sync_ssh_connections", || {
+                let edits = Self::ssh_connection_setting(conn, CONFIGURED_SSH_CONNECTIONS_KEY)?
+                    .and_then(|previous| {
+                        serde_json::from_str::<Vec<ConfiguredSshConnection>>(&previous).log_err()
+                    })
+                    .map(|previous| ssh_argument_edits(&previous, &configured))
+                    .unwrap_or_default();
+                let renames = compose_ssh_argument_renames(
+                    Self::ssh_argument_renames(conn)?,
+                    &edits,
+                    &configured,
+                );
+                let retained_renames = match renames_from_previous_runs {
+                    SshArgumentRenames::Keep => renames.clone(),
+                    SshArgumentRenames::Discard => {
+                        compose_ssh_argument_renames(Vec::new(), &edits, &configured)
+                    }
+                };
+                let connections = conn.select_bound::<&str, (
+                    u64,
+                    Option<String>,
+                    Option<u16>,
+                    Option<String>,
+                    Option<String>,
+                )>(sql!(
+                    SELECT id, host, port, user, args
+                    FROM remote_connections
+                    WHERE kind IS ?
+                ))?(RemoteConnectionKind::Ssh.serialize())?;
+                let mut record_arguments = conn.exec_bound::<(String, u64)>(sql!(
+                    UPDATE remote_connections SET args = ?1 WHERE id = ?2
+                ))?;
+                for (id, host, port, username, args) in connections {
+                    let Some(host) = host else {
+                        continue;
+                    };
+                    let target = SshTarget {
+                        host,
+                        username,
+                        port,
+                    };
+                    let resolved = match args {
+                        None => Some(
+                            configured
+                                .iter()
+                                .find(|connection| connection.target() == target)
+                                .map(|connection| connection.args.clone())
+                                .unwrap_or_default(),
+                        ),
+                        Some(args) => serde_json::from_str::<Vec<String>>(&args)
+                            .ok()
+                            .and_then(|args| renamed_ssh_arguments(&renames, &target, &args)),
+                    };
+                    if let Some(resolved) = resolved {
+                        record_arguments((serde_json::to_string(&resolved)?, id))?;
+                    }
+                }
+                Self::rename_ssh_arguments_in_multi_workspace_states(conn, &renames)?;
+
+                let mut write_setting = conn.exec_bound::<(&str, String)>(sql!(
+                    INSERT OR REPLACE INTO ssh_connection_settings(key, value) VALUES (?1, ?2)
+                ))?;
+                write_setting((
+                    CONFIGURED_SSH_CONNECTIONS_KEY,
+                    serde_json::to_string(&configured)?,
+                ))?;
+                write_setting((
+                    SSH_ARGUMENT_RENAMES_KEY,
+                    serde_json::to_string(&retained_renames)?,
+                ))
+            })
+        })
+        .await
+    }
+
+    fn rename_ssh_arguments_in_multi_workspace_states(
+        conn: &Connection,
+        renames: &[SshArgumentsRename],
+    ) -> Result<()> {
+        if renames.is_empty() {
+            return Ok(());
         }
+        for (key, value) in db::kvp::read_scoped_values(conn, MULTI_WORKSPACE_STATE_NAMESPACE)? {
+            let Some(mut state) =
+                serde_json::from_str::<model::MultiWorkspaceState>(&value).log_err()
+            else {
+                continue;
+            };
+            let mut renamed = false;
+            for group in &mut state.project_groups {
+                let SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(options)) =
+                    &mut group.location
+                else {
+                    continue;
+                };
+                let target = SshTarget {
+                    host: options.host.to_string(),
+                    username: options.username.clone(),
+                    port: options.port,
+                };
+                if let Some(args) = options
+                    .args
+                    .as_deref()
+                    .and_then(|args| renamed_ssh_arguments(renames, &target, args))
+                {
+                    options.args = Some(args);
+                    renamed = true;
+                }
+            }
+            if renamed {
+                db::kvp::write_scoped_value(
+                    conn,
+                    MULTI_WORKSPACE_STATE_NAMESPACE,
+                    &key,
+                    &serde_json::to_string(&state)?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ssh_connection_setting(conn: &Connection, key: &str) -> Result<Option<String>> {
+        conn.select_row_bound::<&str, String>(sql!(
+            SELECT value FROM ssh_connection_settings WHERE key = ?
+        ))?(key)
+    }
+
+    fn ssh_argument_renames(conn: &Connection) -> Result<Vec<SshArgumentsRename>> {
+        Ok(
+            Self::ssh_connection_setting(conn, SSH_ARGUMENT_RENAMES_KEY)?
+                .and_then(|renames| serde_json::from_str(&renames).log_err())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub async fn next_id(&self) -> Result<WorkspaceId> {
+        self.write(|conn| {
+            retry_table_locks(|| {
+                conn.select_row::<WorkspaceId>(sql!(
+                    INSERT INTO workspaces DEFAULT VALUES RETURNING workspace_id
+                ))?()?
+                .context("Inserting a workspace returned no id")
+            })
+            .context("Allocating a workspace id")
+        })
+        .await
     }
 
     fn recent_workspaces(
@@ -2213,6 +2875,7 @@ impl WorkspaceDb {
         Ok(self
             .recent_workspaces_query()?
             .into_iter()
+            .filter_map(|row| row.0)
             .map(
                 |(
                     id,
@@ -2242,15 +2905,30 @@ impl WorkspaceDb {
             .collect())
     }
 
-    query! {
-        fn recent_workspaces_query() -> Result<Vec<(WorkspaceId, String, String, Option<String>, Option<String>, Option<u64>, Option<String>, String)>> {
+    fn recent_workspaces_query(
+        &self,
+    ) -> Result<
+        Vec<
+            Lenient<(
+                WorkspaceId,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<u64>,
+                Option<String>,
+                String,
+            )>,
+        >,
+    > {
+        self.select(sql!(
             SELECT workspace_id, paths, paths_order, identity_paths, identity_paths_order, remote_connection_id, session_id, timestamp
             FROM workspaces
             WHERE
                 paths IS NOT NULL OR
                 remote_connection_id IS NOT NULL
             ORDER BY timestamp DESC
-        }
+        ))?()
     }
 
     fn session_workspaces(
@@ -2271,7 +2949,10 @@ impl WorkspaceDb {
                 |(workspace_id, paths, order, window_id, remote_connection_id)| {
                     (
                         WorkspaceId(workspace_id),
-                        PathList::deserialize(&SerializedPathList { paths, order }),
+                        PathList::deserialize(&SerializedPathList {
+                            paths: lossy_text(paths),
+                            order: lossy_text(order),
+                        }),
                         window_id,
                         remote_connection_id.map(RemoteConnectionId),
                     )
@@ -2281,7 +2962,7 @@ impl WorkspaceDb {
     }
 
     query! {
-        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, String, String, Option<u64>, Option<u64>)>> {
+        fn session_workspaces_query(session_id: String) -> Result<Vec<(i64, Vec<u8>, Vec<u8>, Option<u64>, Option<u64>)>> {
             SELECT workspace_id, paths, paths_order, window_id, remote_connection_id
             FROM workspaces
             WHERE session_id = ?1
@@ -2305,7 +2986,13 @@ impl WorkspaceDb {
     }
 
     fn remote_connections(&self) -> Result<HashMap<RemoteConnectionId, RemoteConnectionOptions>> {
-        Ok(self.select(sql!(
+        Self::remote_connection_rows(self)
+    }
+
+    fn remote_connection_rows(
+        this: &Connection,
+    ) -> Result<HashMap<RemoteConnectionId, RemoteConnectionOptions>> {
+        Ok(this.select(sql!(
             SELECT
                 id, kind, host, port, user, distro, container_id, name, use_podman, remote_env, args
             FROM
@@ -2350,8 +3037,15 @@ impl WorkspaceDb {
         &self,
         id: RemoteConnectionId,
     ) -> Result<RemoteConnectionOptions> {
+        Self::read_remote_connection(self, id)
+    }
+
+    fn read_remote_connection(
+        conn: &Connection,
+        id: RemoteConnectionId,
+    ) -> Result<RemoteConnectionOptions> {
         let (kind, host, port, user, distro, container_id, name, use_podman, remote_env, args) =
-            self.select_row_bound(sql!(
+            conn.select_row_bound(sql!(
                 SELECT kind, host, port, user, distro, container_id, name, use_podman, remote_env, args
                 FROM remote_connections
                 WHERE id = ?
@@ -2413,20 +3107,42 @@ impl WorkspaceDb {
                     remote_env,
                 }))
             }
+            #[cfg(any(test, feature = "test-support"))]
+            RemoteConnectionKind::Mock => Some(RemoteConnectionOptions::Mock(
+                remote::MockConnectionOptions {
+                    id: host?.parse().ok()?,
+                },
+            )),
         }
     }
 
-    query! {
-        pub async fn delete_workspace_by_id(id: WorkspaceId) -> Result<()> {
-            DELETE FROM workspaces
-            WHERE workspace_id IS ?
-        }
+    pub async fn delete_unclaimed_workspaces(
+        &self,
+        workspace_ids: Vec<WorkspaceId>,
+        claims: WorkspaceIdClaims,
+    ) -> Result<Vec<WorkspaceId>> {
+        self.write(move |conn| {
+            let mut delete = conn.exec_bound::<WorkspaceId>(sql!(
+                DELETE FROM workspaces WHERE workspace_id = ?
+            ))?;
+            let mut deleted = Vec::with_capacity(workspace_ids.len());
+            for workspace_id in workspace_ids {
+                let protected = claims.protected();
+                if !protected.contains(workspace_id) {
+                    delete(workspace_id)?;
+                    deleted.push(workspace_id);
+                }
+            }
+            anyhow::Ok(deleted)
+        })
+        .await
     }
 
     async fn session_restore_paths(
         &self,
         workspace_id: WorkspaceId,
         paths: &PathList,
+        has_unsaved_contents: bool,
         fs: &dyn Fs,
     ) -> Option<PathList> {
         if paths.is_empty() {
@@ -2437,7 +3153,7 @@ impl WorkspaceDb {
         for path in paths.ordered_paths() {
             if fs.metadata(path).await.ok().flatten().is_none() {
                 any_missing = true;
-            } else if !is_git_message_file(path) {
+            } else if !is_git_message_file(path, fs).await {
                 restorable_paths.push(path.clone());
             }
         }
@@ -2449,7 +3165,7 @@ impl WorkspaceDb {
             .log_err()
             .flatten()
             .unwrap_or(false);
-        (!any_missing && has_items).then(PathList::default)
+        (has_items && (!any_missing || has_unsaved_contents)).then(PathList::default)
     }
 
     query! {
@@ -2528,12 +3244,13 @@ impl WorkspaceDb {
     pub async fn delete_recent_workspace_group(
         &self,
         target: &RecentWorkspace,
+        claims: WorkspaceIdClaims,
     ) -> Result<Vec<WorkspaceId>> {
         let target_paths = &target.identity_paths;
         let target_remote_connection = match &target.location {
             SerializedWorkspaceLocation::Local => None,
             SerializedWorkspaceLocation::Remote(connection) => {
-                Some(remote_connection_identity(connection))
+                Some(RemoteConnectionTarget::from(connection))
             }
         };
 
@@ -2547,7 +3264,7 @@ impl WorkspaceDb {
                 let Some(connection_options) = remote_connections.get(&id) else {
                     continue;
                 };
-                Some(remote_connection_identity(connection_options))
+                Some(RemoteConnectionTarget::from(connection_options))
             } else {
                 None
             };
@@ -2558,15 +3275,8 @@ impl WorkspaceDb {
             }
         }
 
-        futures::future::join_all(
-            workspace_ids
-                .iter()
-                .copied()
-                .map(|workspace_id| self.delete_workspace_by_id(workspace_id)),
-        )
-        .await;
-
-        Ok(workspace_ids)
+        self.delete_unclaimed_workspaces(workspace_ids, claims)
+            .await
     }
 
     // Deletes workspace rows that can no longer be restored from. Remote workspaces whose
@@ -2577,19 +3287,24 @@ impl WorkspaceDb {
         &self,
         fs: &dyn Fs,
         current_session_id: &str,
-        protected_workspace_ids: &HashSet<WorkspaceId>,
+        workspaces_with_unsaved_contents: &HashSet<WorkspaceId>,
+        claims: ClaimsSnapshot,
     ) -> Result<()> {
+        let claimed_workspace_ids = claims.claims.claimed();
         let remote_connection_ids = self.remote_connection_ids()?;
         let persisted_project_groups = self.persisted_local_project_groups()?;
-        let unavailable_since = self.unavailable_since()?;
+        let tracked_unavailable_roots = self.tracked_unavailable_roots()?;
         let now = Utc::now();
         let mut workspaces_to_delete = Vec::new();
-        let mut still_unavailable = HashMap::default();
+        let mut local_workspace_ids = Vec::new();
+        let mut still_unavailable =
+            HashMap::<WorkspaceId, Vec<(PathBuf, DateTime<Utc>)>>::default();
         for (id, paths, identity_paths_hint, remote_connection_id, session_id, timestamp) in
             self.recent_workspaces()?
         {
             let is_live = session_id.as_deref() == Some(current_session_id)
-                || protected_workspace_ids.contains(&id);
+                || claimed_workspace_ids.contains(&id)
+                || workspaces_with_unsaved_contents.contains(&id);
 
             if let Some(remote_connection_id) = remote_connection_id {
                 if !is_live && !remote_connection_ids.contains(&remote_connection_id) {
@@ -2597,6 +3312,7 @@ impl WorkspaceDb {
                 }
                 continue;
             }
+            local_workspace_ids.push(id);
 
             // Delete the workspace if any of the paths are WSL paths. If a
             // local workspace points to WSL, attempting to read its metadata
@@ -2610,17 +3326,35 @@ impl WorkspaceDb {
                 continue;
             }
 
-            let unavailable_root_since = if session_id.is_some()
-                && Self::existing_paths_include_a_directory(paths.paths(), fs)
-                    .await
-                    .is_none()
-            {
-                let since = unavailable_since.get(&id).copied().unwrap_or(now);
-                still_unavailable.insert(id, since);
-                Some(since)
-            } else {
-                None
-            };
+            let directory_roots = Self::existing_paths_include_a_directory(paths.paths(), fs).await;
+            let mut missing_roots = Vec::new();
+            let mut any_root_inaccessible = false;
+            if directory_roots.is_none() {
+                for root in paths.paths() {
+                    match fs.metadata(root).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => missing_roots.push(root),
+                        Err(_) => any_root_inaccessible = true,
+                    }
+                }
+            }
+            let mut unavailable_roots = Vec::new();
+            if session_id.is_some() {
+                for root in missing_roots {
+                    let since = tracked_unavailable_roots
+                        .get(&id)
+                        .and_then(|tracked| tracked.get(root))
+                        .copied()
+                        .unwrap_or(now);
+                    unavailable_roots.push((root.clone(), since));
+                }
+            }
+            let unavailable_root_in_grace_period = unavailable_roots
+                .iter()
+                .any(|(_, since)| now - *since < UNAVAILABLE_SESSION_WORKSPACE_RETENTION);
+            if !unavailable_roots.is_empty() {
+                still_unavailable.insert(id, unavailable_roots);
+            }
             if is_live {
                 continue;
             }
@@ -2634,17 +3368,20 @@ impl WorkspaceDb {
             }
 
             if session_id.is_some() {
-                if self.session_restore_paths(id, &paths, fs).await.is_some() {
+                if self
+                    .session_restore_paths(id, &paths, false, fs)
+                    .await
+                    .is_some()
+                {
                     continue;
                 }
-                if unavailable_root_since
-                    .is_some_and(|since| now - since < UNAVAILABLE_SESSION_WORKSPACE_RETENTION)
-                {
+                if unavailable_root_in_grace_period {
                     continue;
                 }
             }
 
-            if !Self::all_paths_exist_with_a_directory(paths.paths(), fs).await
+            if !any_root_inaccessible
+                && directory_roots != Some(true)
                 && now - timestamp >= chrono::Duration::days(7)
             {
                 workspaces_to_delete.push(id);
@@ -2653,21 +3390,20 @@ impl WorkspaceDb {
 
         self.write(move |conn| {
             conn.with_savepoint("record_unavailable_workspaces", || {
-                for (key, _) in db::kvp::read_scoped_values(conn, UNAVAILABLE_SINCE_NAMESPACE)? {
-                    let tracked = key
-                        .parse::<i64>()
-                        .is_ok_and(|id| still_unavailable.contains_key(&WorkspaceId(id)));
-                    if !tracked {
-                        db::kvp::delete_scoped_value(conn, UNAVAILABLE_SINCE_NAMESPACE, &key)?;
-                    }
+                let mut forget = conn.exec_bound::<WorkspaceId>(sql!(
+                    DELETE FROM unavailable_roots WHERE workspace_id = ?
+                ))?;
+                for id in &local_workspace_ids {
+                    forget(*id)?;
                 }
-                for (id, since) in &still_unavailable {
-                    db::kvp::insert_scoped_value_if_absent(
-                        conn,
-                        UNAVAILABLE_SINCE_NAMESPACE,
-                        &i64::from(*id).to_string(),
-                        &since.timestamp().to_string(),
-                    )?;
+                let mut track = conn.exec_bound::<(WorkspaceId, &Path, i64)>(sql!(
+                    INSERT OR REPLACE INTO unavailable_roots(workspace_id, root, since)
+                    VALUES (?1, ?2, ?3)
+                ))?;
+                for (id, roots) in &still_unavailable {
+                    for (root, since) in roots {
+                        track((*id, root.as_path(), since.timestamp()))?;
+                    }
                 }
                 Ok(())
             })
@@ -2675,33 +3411,71 @@ impl WorkspaceDb {
         .await
         .log_err();
 
-        futures::future::join_all(
-            workspaces_to_delete
-                .into_iter()
-                .map(|id| self.delete_workspace_by_id(id)),
-        )
-        .await;
-        Ok(())
+        let current_session_id = current_session_id.to_owned();
+        self.write(move |conn| {
+            let mut delete = conn.exec_bound::<(WorkspaceId, &str)>(sql!(
+                DELETE FROM workspaces WHERE workspace_id = ?1 AND session_id IS NOT ?2
+            ))?;
+            for id in workspaces_to_delete {
+                let protected = claims.protected();
+                if !protected.contains(id) {
+                    delete((id, current_session_id.as_str()))?;
+                }
+            }
+            anyhow::Ok(())
+        })
+        .await
     }
 
-    pub(crate) fn unavailable_roots_expired(&self, workspace_id: WorkspaceId) -> bool {
-        self.unavailable_since()
-            .log_err()
-            .and_then(|unavailable_since| unavailable_since.get(&workspace_id).copied())
-            .is_some_and(|since| Utc::now() - since >= UNAVAILABLE_SESSION_WORKSPACE_RETENTION)
+    pub(crate) async fn record_unavailable_roots(
+        &self,
+        workspace_id: WorkspaceId,
+        unavailable_roots: Vec<PathBuf>,
+    ) -> Result<Vec<PathBuf>> {
+        let now = Utc::now();
+        self.write(move |conn| {
+            conn.with_savepoint("record_unavailable_roots", || {
+                let tracked = conn.select_bound::<WorkspaceId, (PathBuf, i64)>(sql!(
+                    SELECT root, since FROM unavailable_roots WHERE workspace_id = ?
+                ))?(workspace_id)?;
+                let mut forget = conn.exec_bound::<(WorkspaceId, &Path)>(sql!(
+                    DELETE FROM unavailable_roots WHERE workspace_id = ?1 AND root = ?2
+                ))?;
+                let mut expired = Vec::new();
+                for (root, since) in &tracked {
+                    if !unavailable_roots.contains(root) {
+                        forget((workspace_id, root.as_path()))?;
+                    } else if DateTime::from_timestamp(*since, 0)
+                        .is_none_or(|since| now - since >= UNAVAILABLE_SESSION_WORKSPACE_RETENTION)
+                    {
+                        expired.push(root.clone());
+                    }
+                }
+                let mut track = conn.exec_bound::<(WorkspaceId, &Path, i64)>(sql!(
+                    INSERT OR IGNORE INTO unavailable_roots(workspace_id, root, since)
+                    VALUES (?1, ?2, ?3)
+                ))?;
+                for root in &unavailable_roots {
+                    track((workspace_id, root.as_path(), now.timestamp()))?;
+                }
+                Ok(expired)
+            })
+        })
+        .await
     }
 
-    fn unavailable_since(&self) -> Result<HashMap<WorkspaceId, DateTime<Utc>>> {
-        Ok(
-            db::kvp::read_scoped_values(self, UNAVAILABLE_SINCE_NAMESPACE)?
-                .into_iter()
-                .filter_map(|(key, since)| {
-                    let id = WorkspaceId(key.parse().ok()?);
-                    let since = DateTime::from_timestamp(since.parse().ok()?, 0)?;
-                    Some((id, since))
-                })
-                .collect(),
-        )
+    fn tracked_unavailable_roots(
+        &self,
+    ) -> Result<HashMap<WorkspaceId, HashMap<PathBuf, DateTime<Utc>>>> {
+        let mut tracked = HashMap::<WorkspaceId, HashMap<PathBuf, DateTime<Utc>>>::default();
+        for (id, root, since) in self.select::<(WorkspaceId, PathBuf, i64)>(sql!(
+            SELECT workspace_id, root, since FROM unavailable_roots
+        ))?()? {
+            if let Some(since) = DateTime::from_timestamp(since, 0) {
+                tracked.entry(id).or_default().insert(root, since);
+            }
+        }
+        Ok(tracked)
     }
 
     pub async fn last_workspace(&self, fs: &dyn Fs) -> Result<Option<RecentWorkspace>> {
@@ -2721,6 +3495,7 @@ impl WorkspaceDb {
         self.restorable_session_workspace_locations(
             &[last_session_id.to_owned()],
             last_session_window_stack.map(|stack| (last_session_id.to_owned(), stack)),
+            &HashSet::default(),
             fs,
         )
         .await
@@ -2730,6 +3505,7 @@ impl WorkspaceDb {
         &self,
         last_session_ids: &[String],
         last_session_window_stack: Option<(String, Vec<WindowId>)>,
+        workspaces_with_unsaved_contents: &HashSet<WorkspaceId>,
         fs: &dyn Fs,
     ) -> Result<Vec<SessionWorkspace>> {
         let mut workspaces = Vec::new();
@@ -2763,8 +3539,14 @@ impl WorkspaceDb {
                     }
                 }
                 None => {
-                    let Some(restore_paths) =
-                        self.session_restore_paths(workspace_id, &paths, fs).await
+                    let Some(restore_paths) = self
+                        .session_restore_paths(
+                            workspace_id,
+                            &paths,
+                            workspaces_with_unsaved_contents.contains(&workspace_id),
+                            fs,
+                        )
+                        .await
                     else {
                         continue;
                     };
@@ -2794,9 +3576,11 @@ impl WorkspaceDb {
         Ok(workspaces)
     }
 
-    fn get_center_pane_group(&self, workspace_id: WorkspaceId) -> Result<SerializedPaneGroup> {
-        Ok(self
-            .get_pane_group(workspace_id, None)?
+    fn get_center_pane_group(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+    ) -> Result<SerializedPaneGroup> {
+        Ok(Self::get_pane_group(conn, workspace_id, None)?
             .into_iter()
             .next()
             .unwrap_or_else(|| {
@@ -2809,20 +3593,20 @@ impl WorkspaceDb {
     }
 
     fn get_pane_group(
-        &self,
+        conn: &Connection,
         workspace_id: WorkspaceId,
         group_id: Option<GroupId>,
     ) -> Result<Vec<SerializedPaneGroup>> {
         type GroupKey = (Option<GroupId>, WorkspaceId);
         type GroupOrPane = (
             Option<GroupId>,
-            Option<SerializedAxis>,
+            Lenient<Option<SerializedAxis>>,
             Option<PaneId>,
             Option<bool>,
             Option<usize>,
-            Option<String>,
+            Lenient<Option<String>>,
         );
-        self.select_bound::<GroupKey, GroupOrPane>(sql!(
+        let rows = conn.select_bound::<GroupKey, GroupOrPane>(sql!(
             SELECT group_id, axis, pane_id, active, pinned_count, flexes
                 FROM (SELECT
                         group_id,
@@ -2850,37 +3634,43 @@ impl WorkspaceDb {
                       JOIN panes ON center_panes.pane_id = panes.pane_id)
                 WHERE parent_group_id IS ? AND workspace_id = ?
                 ORDER BY position
-        ))?((group_id, workspace_id))?
-        .into_iter()
-        .map(|(group_id, axis, pane_id, active, pinned_count, flexes)| {
-            let maybe_pane = maybe!({ Some((pane_id?, active?, pinned_count?)) });
-            if let Some((group_id, axis)) = group_id.zip(axis) {
-                let flexes = flexes
-                    .map(|flexes: String| serde_json::from_str::<Vec<f32>>(&flexes))
-                    .transpose()?;
-
-                Ok(SerializedPaneGroup::Group {
-                    axis,
-                    children: self.get_pane_group(workspace_id, Some(group_id))?,
-                    flexes,
-                })
-            } else if let Some((pane_id, active, pinned_count)) = maybe_pane {
-                Ok(SerializedPaneGroup::Pane(SerializedPane::new(
-                    self.get_items(pane_id)?,
-                    active,
-                    pinned_count,
-                )))
+        ))?((group_id, workspace_id))?;
+        let mut pane_groups = Vec::with_capacity(rows.len());
+        for (child_group_id, axis, pane_id, active, pinned_count, flexes) in rows {
+            let pane_group = if let Some(child_group_id) = child_group_id {
+                SerializedPaneGroup::Group {
+                    axis: axis.0.flatten().unwrap_or(SerializedAxis(Axis::Horizontal)),
+                    children: Self::get_pane_group(conn, workspace_id, Some(child_group_id))?,
+                    flexes: flexes.0.flatten().and_then(|flexes| {
+                        serde_json::from_str::<Vec<f32>>(&flexes)
+                            .with_context(|| {
+                                format!("Decoding pane group flexes of workspace {workspace_id:?}")
+                            })
+                            .log_err()
+                    }),
+                }
+            } else if let Some(pane_id) = pane_id {
+                SerializedPaneGroup::Pane(SerializedPane::new(
+                    Self::get_items(conn, pane_id)?,
+                    active.unwrap_or(false),
+                    pinned_count.unwrap_or(0),
+                ))
             } else {
-                bail!("Pane Group Child was neither a pane group or a pane");
+                log::warn!(
+                    "Skipping a pane group child of workspace {workspace_id:?} that is neither a group nor a pane"
+                );
+                continue;
+            };
+            // Filter out panes and pane groups which don't have any children or items
+            let has_children = match &pane_group {
+                SerializedPaneGroup::Group { children, .. } => !children.is_empty(),
+                SerializedPaneGroup::Pane(pane) => !pane.children.is_empty(),
+            };
+            if has_children {
+                pane_groups.push(pane_group);
             }
-        })
-        // Filter out panes and pane groups which don't have any children or items
-        .filter(|pane_group| match pane_group {
-            Ok(SerializedPaneGroup::Group { children, .. }) => !children.is_empty(),
-            Ok(SerializedPaneGroup::Pane(pane)) => !pane.children.is_empty(),
-            _ => true,
-        })
-        .collect::<Result<_>>()
+        }
+        Ok(pane_groups)
     }
 
     fn save_pane_group(
@@ -2960,12 +3750,26 @@ impl WorkspaceDb {
         Ok(pane_id)
     }
 
-    fn get_items(&self, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
-        self.select_bound(sql!(
-            SELECT kind, item_id, active, preview, unrestored_since FROM items
-            WHERE pane_id = ?
-                ORDER BY position
-        ))?(pane_id)
+    fn get_items(conn: &Connection, pane_id: PaneId) -> Result<Vec<SerializedItem>> {
+        Ok(
+            conn.select_bound::<PaneId, (Vec<u8>, Lenient<ItemId>, Lenient<bool>, Lenient<bool>)>(
+                sql!(
+                    SELECT CAST(kind AS BLOB), item_id, active, preview FROM items
+                    WHERE pane_id = ?
+                        ORDER BY position
+                ),
+            )?(pane_id)?
+            .into_iter()
+            .filter_map(|(kind, item_id, active, preview)| {
+                Some(SerializedItem {
+                    kind: Arc::from(String::from_utf8_lossy(&kind).as_ref()),
+                    item_id: item_id.0?,
+                    active: active.0.unwrap_or(false),
+                    preview: preview.0.unwrap_or(false),
+                })
+            })
+            .collect(),
+        )
     }
 
     fn save_items(
@@ -2975,7 +3779,7 @@ impl WorkspaceDb {
         items: &[SerializedItem],
     ) -> Result<()> {
         let mut insert = conn.exec_bound(sql!(
-            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active, preview, unrestored_since) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO items(workspace_id, pane_id, position, kind, item_id, active, preview) VALUES (?, ?, ?, ?, ?, ?, ?)
         )).context("Preparing insertion")?;
         for (position, item) in items.iter().enumerate() {
             insert((workspace_id, pane_id, position, item))?;
@@ -2998,6 +3802,14 @@ impl WorkspaceDb {
             UPDATE workspaces
             SET timestamp = ?2
             WHERE workspace_id = ?1
+        }
+    }
+
+    #[cfg(test)]
+    query! {
+        pub(crate) async fn set_root_unavailable_since_for_tests(workspace_id: WorkspaceId, root: PathBuf, since: i64) -> Result<()> {
+            INSERT OR REPLACE INTO unavailable_roots(workspace_id, root, since)
+            VALUES (?1, ?2, ?3)
         }
     }
 
@@ -3044,10 +3856,18 @@ impl WorkspaceDb {
         workspace_id: WorkspaceId,
         original: SessionBinding,
         adopted: Option<SessionWindow>,
+        claims: WorkspaceIdClaims,
     ) -> Result<()> {
         self.write(move |conn| {
+            let protected = claims.protected();
             conn.with_savepoint("release_restored_workspace", || {
-                Self::release_restored_rows(conn, workspace_id, &original)?;
+                Self::release_restored_rows(
+                    conn,
+                    workspace_id,
+                    &original,
+                    &HashSet::default(),
+                    &protected,
+                )?;
                 if let Some(adopted) = adopted {
                     Self::release_row_if_bound(
                         conn,
@@ -3068,25 +3888,32 @@ impl WorkspaceDb {
         &self,
         workspace_id: WorkspaceId,
         original: SessionBinding,
+        workspaces_with_unsaved_contents: HashSet<WorkspaceId>,
+        claims: WorkspaceIdClaims,
     ) -> Result<bool> {
         self.write(move |conn| {
+            let protected = claims.protected();
             conn.with_savepoint("record_restore_failure", || {
-                let key = i64::from(workspace_id).to_string();
-                let failures = db::kvp::read_scoped_value(conn, RESTORE_FAILURES_NAMESPACE, &key)?
-                    .and_then(|failures| failures.parse::<u32>().ok())
-                    .unwrap_or(0)
-                    + 1;
+                let Some(failures) = conn.select_row_bound::<WorkspaceId, u32>(sql!(
+                    UPDATE workspaces
+                    SET restore_failures = (restore_failures + 1)
+                    WHERE workspace_id = ?
+                    RETURNING restore_failures
+                ))?(workspace_id)?
+                else {
+                    return Ok(false);
+                };
                 if failures < MAX_RESTORE_ATTEMPTS {
-                    db::kvp::write_scoped_value(
-                        conn,
-                        RESTORE_FAILURES_NAMESPACE,
-                        &key,
-                        &failures.to_string(),
-                    )?;
                     return Ok(false);
                 }
-                db::kvp::delete_scoped_value(conn, RESTORE_FAILURES_NAMESPACE, &key)?;
-                Self::release_restored_rows(conn, workspace_id, &original)?;
+                Self::reset_restore_failures(conn, workspace_id)?;
+                Self::release_restored_rows(
+                    conn,
+                    workspace_id,
+                    &original,
+                    &workspaces_with_unsaved_contents,
+                    &protected,
+                )?;
                 Ok(true)
             })
         })
@@ -3097,11 +3924,7 @@ impl WorkspaceDb {
         self.write(move |conn| {
             conn.with_savepoint("clear_restore_failures", || {
                 for workspace_id in workspace_ids {
-                    db::kvp::delete_scoped_value(
-                        conn,
-                        RESTORE_FAILURES_NAMESPACE,
-                        &i64::from(workspace_id).to_string(),
-                    )?;
+                    Self::reset_restore_failures(conn, workspace_id)?;
                 }
                 Ok(())
             })
@@ -3109,14 +3932,10 @@ impl WorkspaceDb {
         .await
     }
 
-    pub fn bound_session_ids(&self, current_session_id: &str) -> Result<Vec<String>> {
-        self.select_bound::<&str, String>(sql!(
-            SELECT session_id
-            FROM workspaces
-            WHERE session_id IS NOT NULL AND session_id != ?1
-            GROUP BY session_id
-            ORDER BY MAX(timestamp) DESC
-        ))?(current_session_id)
+    fn reset_restore_failures(conn: &Connection, workspace_id: WorkspaceId) -> Result<()> {
+        conn.exec_bound::<WorkspaceId>(sql!(
+            UPDATE workspaces SET restore_failures = (0) WHERE workspace_id = ?
+        ))?(workspace_id)
     }
 
     pub async fn release_sessions_except(
@@ -3126,38 +3945,29 @@ impl WorkspaceDb {
     ) -> Result<()> {
         self.write(move |conn| {
             conn.with_savepoint("release_sessions_except", || {
-                let retained_session_ids = std::iter::once(&current_session_id)
-                    .chain(&restorable_session_ids)
-                    .collect::<Vec<_>>();
-                let placeholders = std::iter::repeat_n("?", retained_session_ids.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "UPDATE workspaces SET session_id = NULL, window_id = NULL \
-                     WHERE session_id IS NOT NULL AND session_id NOT IN ({placeholders})"
-                );
-                let mut statement = Statement::prepare(conn, query)?;
-                let mut next_index = 1;
-                for session_id in &retained_session_ids {
-                    next_index = statement.bind(&session_id.as_str(), next_index)?;
-                }
-                statement.exec()?;
+                let retained_session_ids = serde_json::to_string(
+                    &std::iter::once(&current_session_id)
+                        .chain(&restorable_session_ids)
+                        .collect::<Vec<_>>(),
+                )?;
+                conn.exec_bound::<String>(sql!(
+                    UPDATE workspaces SET session_id = NULL, window_id = NULL
+                    WHERE session_id IS NOT NULL
+                        AND session_id NOT IN (SELECT value FROM json_each(?))
+                ))?(retained_session_ids)?;
 
                 let bound_session_ids = conn.select::<String>(sql!(
                     SELECT DISTINCT session_id FROM workspaces WHERE session_id IS NOT NULL
                 ))?()?
                 .into_iter()
                 .collect::<HashSet<_>>();
-                let still_restorable = std::iter::once(current_session_id.clone())
+                let still_restorable = std::iter::once(&current_session_id)
                     .chain(
                         restorable_session_ids
                             .iter()
-                            .filter(|session_id| {
-                                **session_id != current_session_id
-                                    && bound_session_ids.contains(*session_id)
-                            })
-                            .cloned(),
+                            .filter(|session_id| bound_session_ids.contains(*session_id)),
                     )
+                    .cloned()
                     .collect::<Vec<_>>();
                 db::kvp::write_value(
                     conn,
@@ -3197,14 +4007,41 @@ impl WorkspaceDb {
         .await
     }
 
+    async fn detach_from_session_windows(
+        &self,
+        workspaces: Vec<(WorkspaceId, SessionBinding)>,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            conn.with_savepoint("detach_from_session_windows", || {
+                let mut detach =
+                    conn.exec_bound::<(WorkspaceId, Option<&str>, Option<u64>)>(sql!(
+                        UPDATE workspaces
+                        SET window_id = NULL
+                        WHERE workspace_id = ?1 AND session_id IS ?2 AND window_id IS ?3
+                    ))?;
+                for (workspace_id, binding) in &workspaces {
+                    detach((
+                        *workspace_id,
+                        binding.session_id.as_deref(),
+                        binding.window_id,
+                    ))?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    }
+
     pub(crate) async fn adopt_restored_workspace(
         &self,
         workspace_id: WorkspaceId,
         original: SessionBinding,
         adopted: SessionWindow,
         state: Option<String>,
+        claims: WorkspaceIdClaims,
     ) -> Result<()> {
         self.write(move |conn| {
+            let protected = claims.protected();
             conn.with_savepoint("adopt_restored_workspace", || {
                 if let Some(state) = &state {
                     db::kvp::insert_scoped_value_if_absent(
@@ -3224,6 +4061,7 @@ impl WorkspaceDb {
                         &origin,
                         &adopted.session_id,
                         adopted.window_id,
+                        &protected,
                     )?;
                 }
                 conn.exec_bound(sql!(
@@ -3261,11 +4099,40 @@ impl WorkspaceDb {
         conn: &Connection,
         workspace_id: WorkspaceId,
         binding: &SessionBinding,
+        workspaces_with_unsaved_contents: &HashSet<WorkspaceId>,
+        protected: &ProtectedWorkspaces,
     ) -> Result<()> {
         if let Some(origin) = binding.window() {
-            Self::release_session_window_rows(conn, &origin, None)?;
+            Self::release_session_window_rows(
+                conn,
+                &origin,
+                None,
+                workspaces_with_unsaved_contents,
+                protected,
+            )?;
         }
-        Self::release_row_if_bound(conn, workspace_id, binding)
+        if workspaces_with_unsaved_contents.contains(&workspace_id) {
+            Self::detach_row_if_bound(conn, workspace_id, binding)
+        } else {
+            Self::release_row_if_bound(conn, workspace_id, binding)
+        }
+    }
+
+    fn detach_row_if_bound(
+        conn: &Connection,
+        workspace_id: WorkspaceId,
+        binding: &SessionBinding,
+    ) -> Result<()> {
+        conn.exec_bound(sql!(
+            UPDATE workspaces
+            SET window_id = NULL
+            WHERE workspace_id = ?1 AND session_id IS ?2 AND window_id IS ?3
+        ))?((
+            workspace_id,
+            binding.session_id.as_deref(),
+            binding.window_id,
+        ))
+        .context("detaching the restored workspace")
     }
 
     fn release_row_if_bound(
@@ -3291,6 +4158,7 @@ impl WorkspaceDb {
         origin: &SessionWindow,
         session_id: &str,
         window_id: u64,
+        protected: &ProtectedWorkspaces,
     ) -> Result<()> {
         if origin.session_id == session_id {
             return Ok(());
@@ -3308,29 +4176,107 @@ impl WorkspaceDb {
                 &origin_state,
             )?;
         }
-        Self::release_session_window_rows(conn, origin, Some(workspace_id))
+        Self::release_session_window_rows(
+            conn,
+            origin,
+            Some(workspace_id),
+            &HashSet::default(),
+            protected,
+        )
     }
 
-    pub(crate) async fn release_session_window(&self, origin: SessionWindow) -> Result<()> {
-        self.write(move |conn| Self::release_session_window_rows(conn, &origin, None))
-            .await
+    pub(crate) async fn release_session_window(
+        &self,
+        origin: SessionWindow,
+        claims: WorkspaceIdClaims,
+    ) -> Result<()> {
+        self.write(move |conn| {
+            let protected = claims.protected();
+            Self::release_session_window_rows(conn, &origin, None, &HashSet::default(), &protected)
+        })
+        .await
     }
 
     fn release_session_window_rows(
         conn: &Connection,
         origin: &SessionWindow,
         adopting_workspace_id: Option<WorkspaceId>,
+        workspaces_with_unsaved_contents: &HashSet<WorkspaceId>,
+        protected: &ProtectedWorkspaces,
     ) -> Result<()> {
-        conn.exec_bound(sql!(
-            UPDATE workspaces
-            SET session_id = NULL, window_id = NULL
-            WHERE session_id = ?1 AND window_id = ?2 AND workspace_id IS NOT ?3
-        ))?((
-            origin.session_id.as_str(),
-            origin.window_id,
-            adopting_workspace_id,
-        ))
-        .context("releasing the session window")
+        let remote_connections = Self::remote_connection_rows(conn)?;
+        let members = conn.select_bound::<(&str, u64), (
+            WorkspaceId,
+            Option<String>,
+            Option<String>,
+            Option<u64>,
+            bool,
+        )>(sql!(
+            SELECT
+                workspace_id,
+                paths,
+                paths_order,
+                remote_connection_id,
+                EXISTS(SELECT item_id FROM items WHERE items.workspace_id = workspaces.workspace_id)
+            FROM workspaces
+            WHERE session_id = ?1 AND window_id = ?2
+        ))?((origin.session_id.as_str(), origin.window_id))
+        .context("reading the session window")?
+        .into_iter()
+        .map(
+            |(workspace_id, paths, paths_order, remote_connection_id, has_items)| {
+                let paths = PathList::deserialize(&SerializedPathList {
+                    paths: paths.unwrap_or_default(),
+                    order: paths_order.unwrap_or_default(),
+                });
+                let location = match remote_connection_id {
+                    Some(id) => remote_connections
+                        .get(&RemoteConnectionId(id))
+                        .cloned()
+                        .map(SerializedWorkspaceLocation::Remote),
+                    None => Some(SerializedWorkspaceLocation::Local),
+                };
+                (workspace_id, location, paths, has_items)
+            },
+        )
+        .collect::<Vec<_>>();
+        let window_members = members
+            .iter()
+            .filter_map(|(workspace_id, location, restorable_paths, has_items)| {
+                Some(WindowMember {
+                    workspace_id: *workspace_id,
+                    location: location.clone()?,
+                    restorable_paths: restorable_paths.clone(),
+                    has_items: *has_items,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut release_workspace = conn.exec_bound::<WorkspaceId>(sql!(
+            UPDATE workspaces SET session_id = NULL, window_id = NULL WHERE workspace_id = ?
+        ))?;
+        let mut detach_workspace = conn.exec_bound::<WorkspaceId>(sql!(
+            UPDATE workspaces SET window_id = NULL WHERE workspace_id = ?
+        ))?;
+        for (workspace_id, ..) in &members {
+            if Some(*workspace_id) == adopting_workspace_id || protected.contains(*workspace_id) {
+                continue;
+            }
+            let restores_alone = workspaces_with_unsaved_contents.contains(workspace_id)
+                || window_members
+                    .iter()
+                    .find(|member| member.workspace_id == *workspace_id)
+                    .is_some_and(|member| restores_in_own_window(member, &window_members));
+            if restores_alone {
+                detach_workspace(*workspace_id).context("detaching from the session window")?;
+            } else {
+                release_workspace(*workspace_id).context("releasing the session window")?;
+            }
+        }
+        db::kvp::delete_scoped_value(
+            conn,
+            MULTI_WORKSPACE_STATE_NAMESPACE,
+            &multi_workspace_state_key(&origin.session_id, WindowId::from(origin.window_id)),
+        )
     }
 
     pub(crate) async fn toolchains(
@@ -3571,14 +4517,14 @@ async fn resolve_local_workspace_identity(fs: &dyn Fs, paths: &PathList) -> Opti
 fn dedupe_recent_workspaces(
     workspaces: impl IntoIterator<Item = RecentWorkspace>,
 ) -> Vec<RecentWorkspace> {
-    let mut indices_by_key: HashMap<(Option<RemoteConnectionIdentity>, Vec<PathBuf>), usize> =
+    let mut indices_by_key: HashMap<(Option<RemoteConnectionTarget>, Vec<PathBuf>), usize> =
         HashMap::default();
     let mut result: Vec<RecentWorkspace> = Vec::new();
     for workspace in workspaces {
         let location_identity = match &workspace.location {
             SerializedWorkspaceLocation::Local => None,
             SerializedWorkspaceLocation::Remote(connection) => {
-                Some(remote_connection_identity(connection))
+                Some(RemoteConnectionTarget::from(connection))
             }
         };
         let key = (location_identity, workspace.identity_paths.paths().to_vec());
@@ -3602,6 +4548,24 @@ pub fn delete_unloaded_items(
     db: &ThreadSafeConnection,
     cx: &mut App,
 ) -> Task<Result<()>> {
+    delete_unloaded_items_keeping(
+        alive_items,
+        workspace_id,
+        table,
+        db,
+        |_, _| Ok(Vec::new()),
+        cx,
+    )
+}
+
+pub fn delete_unloaded_items_keeping(
+    alive_items: Vec<ItemId>,
+    workspace_id: WorkspaceId,
+    table: &'static str,
+    db: &ThreadSafeConnection,
+    persisted_references: impl FnOnce(&Connection, WorkspaceId) -> Result<Vec<ItemId>> + Send + 'static,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let db = db.clone();
     let restoring_items = RestoringItems::global(cx);
     let live_items = PersistentItemIds::live_item_ids(cx);
@@ -3613,6 +4577,7 @@ pub fn delete_unloaded_items(
             kept_items.extend(conn.select_bound::<WorkspaceId, ItemId>(sql!(
                 SELECT item_id FROM items WHERE workspace_id = ?
             ))?(workspace_id)?);
+            kept_items.extend(persisted_references(conn, workspace_id)?);
             let stored_items = conn.select_bound::<WorkspaceId, ItemId>(&format!(
                 "SELECT item_id FROM {table} WHERE workspace_id = ?"
             ))?(workspace_id)?;
@@ -3650,7 +4615,6 @@ mod tests {
     use futures::{FutureExt as _, channel::oneshot};
     use gpui::TaskExt;
 
-    use gpui::AppContext as _;
     use pretty_assertions::assert_eq;
     use project::Project;
     use remote::SshConnectionOptions;
@@ -4337,8 +5301,16 @@ mod tests {
         let round_trip_workspace = db.workspace_for_roots(&["/tmp", "/tmp2"]);
         assert_eq!(workspace, round_trip_workspace.unwrap());
 
-        assert!(db.delete_workspace_by_id(workspace.id).await.is_ok());
-        assert!(db.recent_navigation_history(workspace.id).is_empty());
+        assert!(
+            db.delete_unclaimed_workspaces(vec![workspace.id], WorkspaceIdClaims::default())
+                .await
+                .is_ok()
+        );
+        assert!(
+            WorkspaceDb::recent_navigation_history(&db, workspace.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[gpui::test]
@@ -4867,14 +5839,19 @@ mod tests {
     #[gpui::test]
     async fn test_gc_preserves_scratch_inside_window(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
-        let db = WorkspaceDb::open_test_db("test_gc_preserves_scratch_inside_window").await;
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
 
         db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
             .await;
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_some(),
             "fresh stale workspace must not be deleted before the 7-day window"
@@ -4884,7 +5861,7 @@ mod tests {
     #[gpui::test]
     async fn test_gc_deletes_stale_outside_window(cx: &mut gpui::TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
-        let db = WorkspaceDb::open_test_db("test_gc_deletes_stale_outside_window").await;
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
 
         db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
             .await;
@@ -4892,12 +5869,266 @@ mod tests {
             .await
             .unwrap();
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_none(),
             "stale empty workspace older than the retention window must be deleted"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_gc_keeps_stale_workspaces_whose_roots_are_inaccessible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/locked", json!({})).await;
+        fs.set_path_error("/locked", Some(std::io::ErrorKind::PermissionDenied));
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+        for (workspace_id, root) in [(1, "/locked"), (2, "/gone")] {
+            db.save_workspace(workspace_with(
+                workspace_id,
+                &[Path::new(root)],
+                empty_pane_group(),
+                None,
+            ))
+            .await;
+            db.set_timestamp_for_tests(
+                WorkspaceId(workspace_id as i64),
+                "2000-01-01 00:00:00".to_owned(),
+            )
+            .await
+            .unwrap();
+        }
+
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            [1, 2].map(|id| db.workspace_for_id(WorkspaceId(id)).is_some()),
+            [true, false]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unavailable_remote_roots_expire_independently() {
+        let db =
+            WorkspaceDb::open_test_db("test_unavailable_remote_roots_expire_independently").await;
+        db.save_workspace(remote_workspace_with(
+            1,
+            "host",
+            &[Path::new("/a"), Path::new("/b"), Path::new("/c")],
+        ))
+        .await;
+        let workspace_id = WorkspaceId(1);
+        let roots = |roots: &[&str]| roots.iter().map(PathBuf::from).collect::<Vec<_>>();
+
+        let mut expired = Vec::new();
+        expired.push(
+            db.record_unavailable_roots(workspace_id, roots(&["/b"]))
+                .await
+                .unwrap(),
+        );
+        let eight_days_ago = (Utc::now() - chrono::Duration::days(8)).timestamp();
+        db.write(move |conn| {
+            conn.exec_bound::<i64>(sql!(UPDATE unavailable_roots SET since = ?))?(eight_days_ago)
+        })
+        .await
+        .unwrap();
+        for unavailable in [&["/b", "/c"][..], &["/c"], &[]] {
+            expired.push(
+                db.record_unavailable_roots(workspace_id, roots(unavailable))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let tracked = db
+            .select::<PathBuf>(sql!(SELECT root FROM unavailable_roots))
+            .unwrap()()
+        .unwrap();
+
+        assert_eq!(
+            (expired, tracked),
+            (
+                vec![Vec::new(), roots(&["/b"]), Vec::new(), Vec::new()],
+                Vec::new()
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unavailable_local_roots_expire_independently(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let (root_a, root_b) = (Path::new("/a"), Path::new("/b"));
+        db.save_workspace(workspace_with(
+            1,
+            &[root_a, root_b],
+            empty_pane_group(),
+            Some("previous"),
+        ))
+        .await;
+        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
+            .await
+            .unwrap();
+        db.set_root_unavailable_since_for_tests(
+            WorkspaceId(1),
+            root_a.to_path_buf(),
+            (Utc::now() - chrono::Duration::days(8)).timestamp(),
+        )
+        .await
+        .unwrap();
+
+        let restored_before_gc = restored_unavailable_roots(&db, WorkspaceId(1), fs.as_ref()).await;
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
+        let restored_after_gc = restored_unavailable_roots(&db, WorkspaceId(1), fs.as_ref()).await;
+
+        assert_eq!(
+            (restored_before_gc, restored_after_gc),
+            (
+                Some(vec![root_b.to_path_buf()]),
+                Some(vec![root_b.to_path_buf()])
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_migration_preserves_local_unavailable_root_timers(cx: &mut gpui::TestAppContext) {
+        let name = "test_migration_preserves_local_unavailable_root_timers";
+        let legacy = Connection::open_memory(Some(name));
+        let migrations = WorkspaceDb::MIGRATIONS;
+        legacy
+            .migrate(
+                WorkspaceDb::NAME,
+                &migrations[..migrations.len() - 1],
+                &mut |_, _, _| false,
+            )
+            .unwrap();
+        let eight_days_ago = (Utc::now() - chrono::Duration::days(8)).timestamp();
+        legacy
+            .exec_bound::<(&str, i64)>(
+                "INSERT INTO workspaces(workspace_id, paths, paths_order, session_id, timestamp, roots_unavailable_since) \
+                VALUES (1, ?1, '0,1', 'previous', '2000-01-01 00:00:00', ?2)",
+            )
+            .unwrap()(("/available\n/missing", eight_days_ago))
+            .unwrap();
+        let db = WorkspaceDb(db::open_test_db::<db::AppMigrator>(name).await);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/available", json!({})).await;
+        let tracked_roots = |db: &WorkspaceDb| {
+            db.select::<(PathBuf, i64)>("SELECT root, since FROM unavailable_roots ORDER BY root")
+                .unwrap()()
+            .unwrap()
+        };
+
+        let after_migration = tracked_roots(&db);
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
+        let after_gc = tracked_roots(&db);
+
+        let (available, missing) = (PathBuf::from("/available"), PathBuf::from("/missing"));
+        assert_eq!(
+            (after_migration, after_gc),
+            (
+                vec![
+                    (available, eight_days_ago),
+                    (missing.clone(), eight_days_ago)
+                ],
+                vec![(missing, eight_days_ago)]
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_deletions_respect_claims_taken_before_they_execute(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+        let claims = WorkspaceIdClaims::default();
+        let exists = |id: i64| db.workspace_for_id(WorkspaceId(id)).is_some();
+
+        db.save_workspace(workspace_with(1, &[], empty_pane_group(), None))
+            .await;
+        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
+            .await
+            .unwrap();
+        let snapshot_before_reopening = claims.snapshot();
+        drop(claims.try_claim(WorkspaceId(1)));
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            snapshot_before_reopening,
+        )
+        .await
+        .unwrap();
+        let kept_after_reopening = exists(1);
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            claims.snapshot(),
+        )
+        .await
+        .unwrap();
+        let kept_after_fresh_snapshot = exists(1);
+
+        let project = Path::new("/project");
+        db.save_workspace(workspace_with(2, &[project], empty_pane_group(), None))
+            .await;
+        let restoring = claims.try_claim(WorkspaceId(2));
+        db.save_workspace_adopting(
+            workspace_with(3, &[project], empty_pane_group(), None),
+            None,
+            claims.clone(),
+        )
+        .await
+        .unwrap();
+        let kept_while_claimed = exists(2);
+        drop(restoring);
+        db.save_workspace_adopting(
+            workspace_with(3, &[project], empty_pane_group(), None),
+            None,
+            claims.clone(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (
+                kept_after_reopening,
+                kept_after_fresh_snapshot,
+                kept_while_claimed,
+                exists(2)
+            ),
+            (true, false, true, false)
         );
     }
 
@@ -4906,9 +6137,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let fs = fs::FakeFs::new(cx.executor());
-        let db =
-            WorkspaceDb::open_test_db("test_gc_preserves_directory_workspace_with_missing_path")
-                .await;
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
 
         let missing_dir = PathBuf::from("/missing-project-dir");
         db.save_workspace(workspace_with(
@@ -4919,9 +6148,14 @@ mod tests {
         ))
         .await;
 
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_some(),
             "a stale workspace within the retention window must be kept"
@@ -4930,50 +6164,18 @@ mod tests {
         db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
             .await
             .unwrap();
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
         assert!(
             db.workspace_for_id(WorkspaceId(1)).is_none(),
             "a stale workspace past the retention window must be deleted"
         );
-    }
-
-    #[gpui::test]
-    async fn test_gc_keeps_unavailable_session_workspace_for_retention_after_detection(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-        let fs = fs::FakeFs::new(cx.executor());
-        let (db, kvp) = cx.update(|cx| (WorkspaceDb::global(cx), KeyValueStore::global(cx)));
-        let missing_dir = PathBuf::from("/unmounted-volume/project");
-        db.save_workspace(workspace_with(
-            1,
-            &[missing_dir.as_path()],
-            empty_pane_group(),
-            Some("previous"),
-        ))
-        .await;
-        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
-            .await
-            .unwrap();
-
-        let mut kept = Vec::new();
-        for detected_days_ago in [None, Some(6), Some(7)] {
-            if let Some(days) = detected_days_ago {
-                let since = (Utc::now() - chrono::Duration::days(days)).timestamp();
-                kvp.scoped(UNAVAILABLE_SINCE_NAMESPACE)
-                    .write("1".to_string(), since.to_string())
-                    .await
-                    .unwrap();
-            }
-            db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-                .await
-                .unwrap();
-            kept.push(db.workspace_for_id(WorkspaceId(1)).is_some());
-        }
-
-        assert_eq!(kept, [true, true, false]);
     }
 
     #[gpui::test]
@@ -4983,25 +6185,53 @@ mod tests {
         fs.insert_tree("/project", json!({ "notes.txt": "" })).await;
         let (db, kvp) = cx.update(|cx| (WorkspaceDb::global(cx), KeyValueStore::global(cx)));
         let notes = Path::new("/project/notes.txt");
-
-        db.save_workspace(workspace_with(1, &[], empty_pane_group(), Some("current")))
-            .await;
-        db.save_workspace(workspace_with(
-            2,
-            &[],
-            empty_pane_group(),
-            Some("unadopted"),
-        ))
-        .await;
-        db.save_workspace(workspace_with(3, &[notes], empty_pane_group(), None))
-            .await;
-        db.save_workspace(workspace_with(4, &[], empty_pane_group(), None))
-            .await;
-        for id in [1, 2, 3, 4] {
-            db.set_timestamp_for_tests(WorkspaceId(id), "2000-01-01 00:00:00".to_owned())
+        let docker = |name: &str| {
+            RemoteConnectionOptions::Docker(DockerConnectionOptions {
+                name: name.to_owned(),
+                container_id: name.to_owned(),
+                remote_user: "user".to_owned(),
+                upload_binary_over_docker_exec: false,
+                use_podman: false,
+                remote_env: BTreeMap::default(),
+            })
+        };
+        let remote = |id, name| SerializedWorkspace {
+            location: SerializedWorkspaceLocation::Remote(docker(name)),
+            ..workspace_with(
+                id,
+                &[Path::new("/remote")],
+                empty_pane_group(),
+                Some("previous"),
+            )
+        };
+        for workspace in [
+            workspace_with(1, &[], empty_pane_group(), Some("current")),
+            workspace_with(2, &[], empty_pane_group(), Some("unadopted")),
+            workspace_with(3, &[notes], empty_pane_group(), None),
+            workspace_with(4, &[], empty_pane_group(), None),
+            workspace_with(
+                5,
+                &[Path::new("/unmounted-volume/project")],
+                empty_pane_group(),
+                Some("previous"),
+            ),
+            remote(6, "legacy"),
+            remote(7, "corrupt"),
+        ] {
+            let workspace_id = workspace.id;
+            db.save_workspace(workspace).await;
+            db.set_timestamp_for_tests(workspace_id, "2000-01-01 00:00:00".to_owned())
                 .await
                 .unwrap();
         }
+        db.write(|conn| {
+            conn.exec(
+                "UPDATE remote_connections SET remote_env = NULL, use_podman = NULL WHERE name = 'legacy'",
+            )?()?;
+            conn.exec("UPDATE remote_connections SET remote_env = 'corrupt' WHERE name = 'corrupt'")?()
+        })
+        .await
+        .unwrap();
         write_multi_workspace_state(
             &kvp,
             "current",
@@ -5015,81 +6245,6 @@ mod tests {
             },
         )
         .await;
-
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
-
-        assert_eq!(
-            [1, 2, 3, 4].map(|id| db.workspace_for_id(WorkspaceId(id)).is_some()),
-            [true, true, true, false]
-        );
-    }
-
-    #[gpui::test]
-    async fn test_gc_deletes_empty_workspace_with_items(cx: &mut gpui::TestAppContext) {
-        let fs = fs::FakeFs::new(cx.executor());
-        let db = WorkspaceDb::open_test_db("test_gc_deletes_empty_workspace_with_items").await;
-
-        db.save_workspace(workspace_with(1, &[], pane_with_items(&[100]), None))
-            .await;
-        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
-            .await
-            .unwrap();
-
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
-        assert!(
-            db.workspace_for_id(WorkspaceId(1)).is_none(),
-            "a stale empty-path workspace must be deleted regardless of its items"
-        );
-    }
-
-    #[gpui::test]
-    async fn test_gc_keeps_remote_workspaces_whose_connection_row_exists(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let fs = fs::FakeFs::new(cx.executor());
-        let db = WorkspaceDb::open_test_db(
-            "test_gc_keeps_remote_workspaces_whose_connection_row_exists",
-        )
-        .await;
-        let docker = |name: &str| {
-            RemoteConnectionOptions::Docker(DockerConnectionOptions {
-                name: name.to_owned(),
-                container_id: name.to_owned(),
-                remote_user: "user".to_owned(),
-                upload_binary_over_docker_exec: false,
-                use_podman: false,
-                remote_env: BTreeMap::default(),
-            })
-        };
-        for (id, name) in [(1, "legacy"), (2, "corrupt")] {
-            db.save_workspace(SerializedWorkspace {
-                location: SerializedWorkspaceLocation::Remote(docker(name)),
-                ..workspace_with(
-                    id,
-                    &[Path::new("/remote")],
-                    empty_pane_group(),
-                    Some("previous"),
-                )
-            })
-            .await;
-        }
-        db.write(|conn| {
-            conn.exec(
-                "UPDATE remote_connections SET remote_env = NULL, use_podman = NULL WHERE name = 'legacy'",
-            )?()?;
-            conn.exec("UPDATE remote_connections SET remote_env = 'corrupt' WHERE name = 'corrupt'")?()
-        })
-        .await
-        .unwrap();
-
-        db.garbage_collect_workspaces(fs.as_ref(), "current", &HashSet::default())
-            .await
-            .unwrap();
-
         let workspace_exists = |id: i64| {
             db.select_row_bound::<i64, i64>(
                 "SELECT workspace_id FROM workspaces WHERE workspace_id = ?",
@@ -5098,16 +6253,69 @@ mod tests {
             .unwrap()
             .is_some()
         };
+
+        let mut kept = Vec::new();
+        for unavailable_days_ago in [None, Some(6), Some(7)] {
+            if let Some(days) = unavailable_days_ago {
+                let since = (Utc::now() - chrono::Duration::days(days)).timestamp();
+                db.set_root_unavailable_since_for_tests(
+                    WorkspaceId(5),
+                    PathBuf::from("/unmounted-volume/project"),
+                    since,
+                )
+                .await
+                .unwrap();
+            }
+            db.garbage_collect_workspaces(
+                fs.as_ref(),
+                "current",
+                &HashSet::default(),
+                WorkspaceIdClaims::default().snapshot(),
+            )
+            .await
+            .unwrap();
+            kept.push((1..=7).map(workspace_exists).collect::<Vec<_>>());
+        }
+
         assert_eq!(
             (
-                [1, 2].map(workspace_exists),
-                db.workspace_for_id(WorkspaceId(1))
-                    .map(|workspace| workspace.location),
+                kept,
+                db.workspace_for_id(WorkspaceId(6))
+                    .map(|workspace| workspace.location)
             ),
             (
-                [true, true],
+                vec![
+                    vec![true, true, true, false, true, true, true],
+                    vec![true, true, true, false, true, true, true],
+                    vec![true, true, true, false, false, true, true],
+                ],
                 Some(SerializedWorkspaceLocation::Remote(docker("legacy")))
             )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_gc_deletes_empty_workspace_with_items(cx: &mut gpui::TestAppContext) {
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+
+        db.save_workspace(workspace_with(1, &[], pane_with_items(&[100]), None))
+            .await;
+        db.set_timestamp_for_tests(WorkspaceId(1), "2000-01-01 00:00:00".to_owned())
+            .await
+            .unwrap();
+
+        db.garbage_collect_workspaces(
+            fs.as_ref(),
+            "current",
+            &HashSet::default(),
+            WorkspaceIdClaims::default().snapshot(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            db.workspace_for_id(WorkspaceId(1)).is_none(),
+            "a stale empty-path workspace must be deleted regardless of its items"
         );
     }
 
@@ -5126,39 +6334,25 @@ mod tests {
             ))
             .await;
         }
-        Session::new("last".to_owned(), kvp.clone()).await;
-        kvp.delete_kvp(session::RESTORABLE_SESSION_IDS_KEY.to_owned())
+        for session_id in ["last", "interrupted"] {
+            Session::new(session_id.to_owned(), kvp.clone()).await;
+        }
+        let next_restorable = Session::new("next".to_owned(), kvp.clone())
             .await
-            .unwrap();
-        let restorable_sessions = |session_id: &str| {
-            let kvp = kvp.clone();
-            let session_id = session_id.to_owned();
-            async move {
-                Session::new(session_id, kvp)
-                    .await
-                    .restorable_session_ids()
-                    .to_vec()
-            }
-        };
-
-        restorable_sessions("interrupted").await;
-        let next_restorable = restorable_sessions("next").await;
+            .restorable_session_ids()
+            .to_vec();
         db.release_sessions_except("next".to_owned(), next_restorable.clone())
             .await
             .unwrap();
-        let after_restorable = restorable_sessions("after").await;
+        let after_restorable = Session::new("after".to_owned(), kvp)
+            .await
+            .restorable_session_ids()
+            .to_vec();
 
         assert_eq!(
             (
                 next_restorable,
-                [1, 2].map(|id| {
-                    db.select_row_bound::<i64, Option<String>>(
-                        "SELECT session_id FROM workspaces WHERE workspace_id = ?",
-                    )
-                    .unwrap()(id)
-                    .unwrap()
-                    .flatten()
-                }),
+                [1, 2].map(|id| session_binding(&db, WorkspaceId(id)).0),
                 after_restorable,
             ),
             (
@@ -5198,34 +6392,107 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_session_restore_keeps_content_beside_transient_or_missing_roots(
+    async fn test_session_restore_skips_unrestorable_roots_and_connections(
         cx: &mut gpui::TestAppContext,
     ) {
         let fs = fs::FakeFs::new(cx.executor());
         fs.insert_tree(
             "/repo",
-            json!({ "note.txt": "", ".git": { "COMMIT_EDITMSG": "" } }),
+            json!({
+                "note.txt": "",
+                ".git": {
+                    "HEAD": "ref: refs/heads/main\n",
+                    "objects": {},
+                    "config": "",
+                    "COMMIT_EDITMSG": "",
+                    "worktrees": {
+                        "feature": {
+                            "HEAD": "ref: refs/heads/feature\n",
+                            "commondir": "../..\n",
+                            "MERGE_MSG": "",
+                        },
+                    },
+                },
+            }),
         )
         .await;
+        fs.insert_tree(
+            "/bare.git",
+            json!({ "HEAD": "ref: refs/heads/main\n", "objects": {}, "COMMIT_EDITMSG": "" }),
+        )
+        .await;
+        fs.insert_tree("/notes", json!({ "MERGE_MSG": "" })).await;
+        fs.insert_tree("/fixture.git", json!({ "COMMIT_EDITMSG": "" }))
+            .await;
         let db = WorkspaceDb::open_test_db(
-            "test_session_restore_keeps_content_beside_transient_or_missing_roots",
+            "test_session_restore_skips_unrestorable_roots_and_connections",
         )
         .await;
-        let commit_message = Path::new("/repo/.git/COMMIT_EDITMSG");
         let note = Path::new("/repo/note.txt");
+        let config = Path::new("/repo/.git/config");
+        let commit_message = Path::new("/repo/.git/COMMIT_EDITMSG");
+        let non_git_message = Path::new("/notes/MERGE_MSG");
+        let headless_git_message = Path::new("/fixture.git/COMMIT_EDITMSG");
         let missing = Path::new("/gone/deleted.txt");
-        let other_missing = Path::new("/gone/other.txt");
         let workspaces = [
-            (&[commit_message][..], pane_with_items(&[1])),
-            (&[commit_message, missing][..], pane_with_items(&[2])),
-            (&[note, missing][..], pane_with_items(&[3])),
-            (&[note, other_missing][..], empty_pane_group()),
-            (&[missing][..], pane_with_items(&[4])),
+            (vec![note], empty_pane_group(), Some(vec![note])),
+            (vec![config], empty_pane_group(), Some(vec![config])),
+            (
+                vec![Path::new("/repo"), commit_message],
+                empty_pane_group(),
+                Some(vec![Path::new("/repo")]),
+            ),
+            (vec![commit_message], empty_pane_group(), None),
+            (
+                vec![Path::new("/repo/.git/worktrees/feature/MERGE_MSG")],
+                empty_pane_group(),
+                None,
+            ),
+            (
+                vec![Path::new("/bare.git/COMMIT_EDITMSG")],
+                empty_pane_group(),
+                None,
+            ),
+            (
+                vec![non_git_message],
+                empty_pane_group(),
+                Some(vec![non_git_message]),
+            ),
+            (
+                vec![headless_git_message],
+                empty_pane_group(),
+                Some(vec![headless_git_message]),
+            ),
+            (
+                vec![commit_message],
+                pane_with_items(&[1]),
+                Some(Vec::new()),
+            ),
+            (vec![commit_message, missing], pane_with_items(&[2]), None),
+            (vec![note, missing], pane_with_items(&[3]), Some(vec![note])),
+            (
+                vec![note, Path::new("/gone/other.txt")],
+                empty_pane_group(),
+                Some(vec![note]),
+            ),
+            (vec![missing], pane_with_items(&[4]), None),
         ];
-        for (id, (paths, center_group)) in (1..).zip(workspaces) {
-            db.save_workspace(workspace_with(id, paths, center_group, Some("s")))
+        let mut expected = Vec::new();
+        for (id, (paths, center_group, restored_paths)) in (1..).zip(workspaces) {
+            db.save_workspace(workspace_with(id, &paths, center_group, Some("s")))
                 .await;
+            if let Some(restored_paths) = restored_paths {
+                expected.push((WorkspaceId(id as i64), PathList::new(&restored_paths)));
+            }
         }
+        db.save_workspace(SerializedWorkspace {
+            session_id: Some("s".to_owned()),
+            ..remote_workspace_with(100, "host", &[Path::new("/remote")])
+        })
+        .await;
+        db.write(|conn| conn.exec("UPDATE remote_connections SET kind = 'unknown'")?())
+            .await
+            .unwrap();
 
         let mut restored = db
             .last_session_workspace_locations("s", None, fs.as_ref())
@@ -5235,70 +6502,7 @@ mod tests {
             .map(|session| (session.workspace_id, session.paths))
             .collect::<Vec<_>>();
         restored.sort_by_key(|(workspace_id, _)| *workspace_id);
-        assert_eq!(
-            restored,
-            vec![
-                (WorkspaceId(1), PathList::default()),
-                (WorkspaceId(3), PathList::new(&[note])),
-                (WorkspaceId(4), PathList::new(&[note])),
-            ]
-        );
-    }
-
-    #[gpui::test]
-    async fn test_last_session_restores_file_only_workspace(cx: &mut gpui::TestAppContext) {
-        let fs = fs::FakeFs::new(cx.executor());
-        fs.insert_tree(
-            "/repo",
-            json!({
-                "note.txt": "",
-                ".git": {
-                    "config": "",
-                    "COMMIT_EDITMSG": "",
-                    "worktrees": { "feature": { "MERGE_MSG": "" } },
-                },
-            }),
-        )
-        .await;
-        fs.insert_tree("/bare.git", json!({ "COMMIT_EDITMSG": "" }))
-            .await;
-        fs.insert_tree("/notes", json!({ "MERGE_MSG": "" })).await;
-        let db = WorkspaceDb::open_test_db("test_last_session_restores_file_only_workspace").await;
-        let workspaces = [
-            vec![PathBuf::from("/repo/note.txt")],
-            vec![PathBuf::from("/repo/.git/config")],
-            vec![
-                PathBuf::from("/repo"),
-                PathBuf::from("/repo/.git/COMMIT_EDITMSG"),
-            ],
-            vec![PathBuf::from("/repo/.git/COMMIT_EDITMSG")],
-            vec![PathBuf::from("/repo/.git/worktrees/feature/MERGE_MSG")],
-            vec![PathBuf::from("/bare.git/COMMIT_EDITMSG")],
-            vec![PathBuf::from("/notes/MERGE_MSG")],
-        ];
-        for (id, paths) in (1..).zip(&workspaces) {
-            let paths = paths.iter().map(PathBuf::as_path).collect::<Vec<_>>();
-            db.save_workspace(workspace_with(id, &paths, empty_pane_group(), Some("s")))
-                .await;
-        }
-
-        let mut sessions = db
-            .last_session_workspace_locations("s", None, fs.as_ref())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|session| session.workspace_id)
-            .collect::<Vec<_>>();
-        sessions.sort();
-        assert_eq!(
-            sessions,
-            vec![
-                WorkspaceId(1),
-                WorkspaceId(2),
-                WorkspaceId(3),
-                WorkspaceId(7)
-            ]
-        );
+        assert_eq!(restored, expected);
     }
 
     #[gpui::test]
@@ -5345,6 +6549,7 @@ mod tests {
                 window_id: 9,
             },
             None,
+            WorkspaceIdClaims::default(),
         )
         .await
         .unwrap();
@@ -5396,106 +6601,618 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restored_workspace_release_wins_regardless_of_adoption_order(
+    async fn test_window_persists_restored_state_until_it_is_applied(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        multi_workspace.update_in(cx, |mw, _, cx| mw.set_random_database_id(cx));
+        let restored_group = ProjectGroupKey::new(None, PathList::new(&[Path::new("/restored")]));
+        let (session_id, window_id) = multi_workspace.update_in(cx, |mw, window, cx| {
+            mw.begin_restoring_state(model::MultiWorkspaceState {
+                active_workspace_id: None,
+                sidebar_open: true,
+                project_groups: vec![model::SerializedProjectGroup::from_group(
+                    &restored_group,
+                    false,
+                )],
+                sidebar_state: Some("restored sidebar".to_owned()),
+            });
+            mw.serialize(cx);
+            (
+                mw.workspace().read(cx).session_id().unwrap(),
+                window.window_handle().window_id(),
+            )
+        });
+        let persisted = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            let state =
+                cx.update(|_, cx| read_multi_workspace_state(Some(&session_id), window_id, cx));
+            (
+                state
+                    .project_groups
+                    .into_iter()
+                    .map(ProjectGroupKey::from)
+                    .collect::<Vec<_>>(),
+                state.sidebar_open,
+                state.sidebar_state,
+            )
+        };
+        let while_restoring = persisted(cx);
+        multi_workspace.update(cx, |mw, cx| mw.finish_restoring_state(cx));
+        let after_restoring = persisted(cx);
+
+        assert_eq!(
+            (while_restoring, after_restoring),
+            (
+                (
+                    vec![restored_group],
+                    true,
+                    Some("restored sidebar".to_owned())
+                ),
+                (Vec::new(), false, None),
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_siblings_restored_in_their_own_windows_survive_adoption(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/",
+            json!({
+                "project": {},
+                "other": {},
+                "restoring": {},
+                "notes": { "MERGE_MSG": {} },
+                "repo": {
+                    ".git": { "HEAD": "ref: refs/heads/main", "objects": {}, "COMMIT_EDITMSG": "" },
+                },
+            }),
+        )
+        .await;
         let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let kvp = cx.update(|cx| KeyValueStore::global(cx));
+        let origin_window = WindowId::from(7u64);
+        for (id, paths, center_group) in [
+            (1, vec![Path::new("/project")], empty_pane_group()),
+            (2, Vec::new(), pane_with_items(&[1])),
+            (3, Vec::new(), empty_pane_group()),
+            (
+                4,
+                vec![Path::new("/repo/.git/COMMIT_EDITMSG")],
+                pane_with_items(&[2]),
+            ),
+            (5, vec![Path::new("/other")], pane_with_items(&[3])),
+            (6, vec![Path::new("/project")], pane_with_items(&[4])),
+            (7, vec![Path::new("/restoring")], pane_with_items(&[5])),
+            (
+                9,
+                vec![Path::new("/notes/MERGE_MSG")],
+                pane_with_items(&[7]),
+            ),
+            (10, vec![Path::new("/unmounted")], pane_with_items(&[8])),
+            (11, vec![Path::new("/unmounted")], pane_with_items(&[9])),
+        ] {
+            db.save_workspace(SerializedWorkspace {
+                window_id: Some(origin_window.as_u64()),
+                ..workspace_with(id, &paths, center_group, Some("previous"))
+            })
+            .await;
+        }
+        db.save_workspace(SerializedWorkspace {
+            session_id: Some("previous".to_owned()),
+            window_id: Some(origin_window.as_u64()),
+            center_group: pane_with_items(&[6]),
+            ..remote_workspace_with(8, "host", &[])
+        })
+        .await;
+        let claims = WorkspaceIdClaims::default();
+        let _restoring = claims.try_claim(WorkspaceId(7));
+        write_multi_workspace_state(
+            &kvp,
+            "previous",
+            origin_window,
+            model::MultiWorkspaceState {
+                active_workspace_id: Some(WorkspaceId(1)),
+                ..model::MultiWorkspaceState::default()
+            },
+        )
+        .await;
         let original = SessionBinding {
             session_id: Some("previous".to_owned()),
-            window_id: Some(7),
+            window_id: Some(origin_window.as_u64()),
         };
         let adopted = SessionWindow {
             session_id: "current".to_owned(),
             window_id: 9,
         };
-        let mut bindings = Vec::new();
-        for adopt_first in [true, false] {
-            for id in [1, 2] {
-                db.save_workspace(SerializedWorkspace {
-                    window_id: original.window_id,
-                    ..workspace_with(id, &[], empty_pane_group(), Some("previous"))
-                })
-                .await;
-            }
-            let adopt = db.adopt_restored_workspace(
-                WorkspaceId(1),
-                original.clone(),
-                adopted.clone(),
-                None,
-            );
-            let release = db.release_restored_workspace(
-                WorkspaceId(1),
-                original.clone(),
-                Some(adopted.clone()),
-            );
-            if adopt_first {
-                adopt.await.unwrap();
-                release.await.unwrap();
-            } else {
-                release.await.unwrap();
-                adopt.await.unwrap();
-            }
-            bindings.push([WorkspaceId(1), WorkspaceId(2)].map(|id| {
-                db.workspace_for_id(id)
-                    .and_then(|workspace| workspace.session_id)
-            }));
-        }
+        let bindings =
+            || [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map(|id| session_binding(&db, WorkspaceId(id)));
 
-        assert_eq!(bindings, vec![[None, None], [None, None]]);
+        let locations = db
+            .restorable_session_workspace_locations(
+                &["previous".to_owned()],
+                None,
+                &HashSet::default(),
+                fs.as_ref(),
+            )
+            .await
+            .unwrap();
+        let mut planned_windows = cx
+            .update(|cx| read_serialized_multi_workspaces(locations, cx))
+            .await
+            .into_iter()
+            .map(|window| {
+                (
+                    window.active_workspace.workspace_id,
+                    window.active_workspace.window_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        planned_windows.sort_by_key(|(workspace_id, _)| *workspace_id);
+        let bindings_after_planning = bindings();
+        db.adopt_restored_workspace(
+            WorkspaceId(1),
+            original.clone(),
+            adopted.clone(),
+            None,
+            claims.clone(),
+        )
+        .await
+        .unwrap();
+        let bindings_after_adoption = bindings();
+        let origin_state = cx.update(|cx| {
+            read_multi_workspace_state(Some("previous"), origin_window, cx).active_workspace_id
+        });
+        db.release_restored_workspace(WorkspaceId(1), original, Some(adopted), claims)
+            .await
+            .unwrap();
+
+        let in_window = || (Some("previous".to_owned()), Some(origin_window.as_u64()));
+        let own_window = || (Some("previous".to_owned()), None);
+        let released = || (None, None);
+        assert_eq!(
+            (
+                planned_windows,
+                bindings_after_planning,
+                bindings_after_adoption,
+                origin_state,
+                bindings()
+            ),
+            (
+                vec![
+                    (WorkspaceId(1), Some(origin_window)),
+                    (WorkspaceId(2), None),
+                    (WorkspaceId(4), None),
+                    (WorkspaceId(6), None),
+                    (WorkspaceId(8), None),
+                ],
+                [
+                    in_window(),
+                    own_window(),
+                    in_window(),
+                    own_window(),
+                    in_window(),
+                    own_window(),
+                    in_window(),
+                    own_window(),
+                    in_window(),
+                    in_window(),
+                    in_window(),
+                ],
+                [
+                    (Some("current".to_owned()), Some(9)),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    in_window(),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    own_window(),
+                ],
+                None,
+                [
+                    released(),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    in_window(),
+                    own_window(),
+                    released(),
+                    own_window(),
+                    own_window(),
+                ],
+            )
+        );
     }
 
     #[gpui::test]
-    async fn test_failed_restoration_is_retried_once(cx: &mut gpui::TestAppContext) {
+    async fn test_remote_window_position_follows_the_restored_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let display = Uuid::new_v4();
+        let bounds = |x: f32| {
+            WindowBounds::Windowed(Bounds::new(point(px(x), px(0.)), size(px(800.), px(600.))))
+        };
+        for (id, x) in [(1, 10.), (2, 20.)] {
+            db.save_workspace(SerializedWorkspace {
+                session_id: Some("session".to_owned()),
+                ..remote_workspace_with(id, "host", &[Path::new("/repo")])
+            })
+            .await;
+            db.set_window_open_status(
+                WorkspaceId(id as i64),
+                SerializedWindowBounds(bounds(x)),
+                display,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let connection = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "host".into(),
+            ..Default::default()
+        });
+
+        let mut positions = Vec::new();
+        for workspace_id in [WorkspaceId(1), WorkspaceId(2)] {
+            let position = cx
+                .update(|cx| {
+                    crate::remote_workspace_position_from_db(
+                        connection.clone(),
+                        &[PathBuf::from("/repo")],
+                        Some(workspace_id),
+                        cx,
+                    )
+                })
+                .await
+                .unwrap();
+            positions.push(position.window_bounds);
+        }
+
+        assert_eq!(positions, vec![Some(bounds(10.)), Some(bounds(20.))]);
+    }
+
+    #[gpui::test]
+    async fn test_failed_restoration_is_retried_once_per_workspace_lifetime(
+        cx: &mut gpui::TestAppContext,
+    ) {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
         let db = cx.update(|cx| WorkspaceDb::global(cx));
         let original = SessionBinding {
             session_id: Some("previous".to_owned()),
             window_id: Some(7),
         };
-        db.save_workspace(SerializedWorkspace {
-            window_id: original.window_id,
-            ..workspace_with(1, &[], empty_pane_group(), Some("previous"))
-        })
-        .await;
+        let save_workspace = || {
+            db.save_workspace(SerializedWorkspace {
+                window_id: original.window_id,
+                ..workspace_with(1, &[], empty_pane_group(), Some("previous"))
+            })
+        };
+        save_workspace().await;
 
         let mut outcomes = Vec::new();
-        for _ in 0..2 {
+        for reuse_workspace_id in [false, true, false] {
+            if reuse_workspace_id {
+                db.delete_unclaimed_workspaces(vec![WorkspaceId(1)], WorkspaceIdClaims::default())
+                    .await
+                    .unwrap();
+                save_workspace().await;
+            }
             let released = db
-                .record_restore_failure(WorkspaceId(1), original.clone())
+                .record_restore_failure(
+                    WorkspaceId(1),
+                    original.clone(),
+                    HashSet::default(),
+                    WorkspaceIdClaims::default(),
+                )
                 .await
                 .unwrap();
-            outcomes.push((released, db.bound_session_ids("current").unwrap()));
+            outcomes.push((released, session_binding(&db, WorkspaceId(1))));
         }
 
+        let bound = (Some("previous".to_owned()), original.window_id);
         assert_eq!(
             outcomes,
-            vec![
-                (false, vec!["previous".to_owned()]),
-                (true, Vec::<String>::new())
-            ]
+            vec![(false, bound.clone()), (false, bound), (true, (None, None))]
         );
     }
 
     #[gpui::test]
-    async fn test_persistent_item_ids_never_reuse_entity_or_earlier_process_ids(
+    async fn test_exhausted_restore_attempts_keep_unsaved_workspaces_restorable(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-        let (first, second) = (cx.new(|_| ()), cx.new(|_| ()));
-        let (first_process, next_process) = cx.update(|cx| {
-            let first_process = [
-                persistent_item_id(&first, cx),
-                persistent_item_id(&first, cx),
-                persistent_item_id(&second, cx),
-            ];
-            cx.remove_global::<PersistentItemIds>();
-            (first_process, persistent_item_id(&first, cx))
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let original = SessionBinding {
+            session_id: Some("previous".to_owned()),
+            window_id: Some(7),
+        };
+        for workspace in [
+            workspace_with(1, &[], pane_with_items(&[100]), Some("previous")),
+            workspace_with(
+                2,
+                &[Path::new("/gone")],
+                pane_with_items(&[200]),
+                Some("previous"),
+            ),
+            workspace_with(
+                3,
+                &[Path::new("/saved")],
+                pane_with_items(&[300]),
+                Some("previous"),
+            ),
+        ] {
+            db.save_workspace(SerializedWorkspace {
+                window_id: original.window_id,
+                ..workspace
+            })
+            .await;
+        }
+        let claims = WorkspaceIdClaims::default();
+        let _restoration_claim = claims.try_claim(WorkspaceId(1));
+        let workspaces_with_unsaved_contents = [WorkspaceId(1), WorkspaceId(2)]
+            .into_iter()
+            .collect::<HashSet<_>>();
+
+        let mut released = Vec::new();
+        for _ in 0..MAX_RESTORE_ATTEMPTS {
+            released.push(
+                db.record_restore_failure(
+                    WorkspaceId(1),
+                    original.clone(),
+                    workspaces_with_unsaved_contents.clone(),
+                    claims.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+
+        let detached = (Some("previous".to_owned()), None);
+        assert_eq!(
+            (
+                released,
+                [1, 2, 3].map(|id| session_binding(&db, WorkspaceId(id)))
+            ),
+            (
+                vec![false, true],
+                [detached.clone(), detached, (None, None)]
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_reads_distinguish_missing_from_unreadable() {
+        let db =
+            WorkspaceDb::open_test_db("test_workspace_reads_distinguish_missing_from_unreadable")
+                .await;
+        db.save_workspace(workspace_with(
+            1,
+            &[Path::new("/project")],
+            empty_pane_group(),
+            None,
+        ))
+        .await;
+        db.save_workspace(remote_workspace_with(2, "host", &[Path::new("/remote")]))
+            .await;
+        let location = |workspace_id: i64| {
+            WorkspaceDb::read_workspace(&db, WorkspaceId(workspace_id))
+                .map(|workspace| workspace.map(|workspace| workspace.location))
+                .ok()
+        };
+
+        db.write(|conn| conn.exec("UPDATE remote_connections SET kind = 'bogus'")?())
+            .await
+            .unwrap();
+        let with_unknown_remote_connection = (location(1), location(2), location(99));
+        db.write(|conn| conn.exec("DROP TABLE bookmarks")?())
+            .await
+            .unwrap();
+        let claimed_by_roots = db
+            .claim_settled_workspace_for_roots(
+                &[Path::new("/project")],
+                None,
+                |workspace_id| WorkspaceIdClaims::default().try_claim(workspace_id),
+                &WorkspaceWrites::default(),
+            )
+            .await;
+        let with_unreadable_bookmarks = (location(1), claimed_by_roots.is_err());
+
+        assert_eq!(
+            (with_unknown_remote_connection, with_unreadable_bookmarks),
+            (
+                (
+                    Some(Some(SerializedWorkspaceLocation::Local)),
+                    None,
+                    Some(None)
+                ),
+                (None, true)
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_unreadable_saved_workspace_is_never_opened_fresh(cx: &mut gpui::TestAppContext) {
+        crate::tests::init_test(cx);
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let app_state = cx.update(crate::AppState::test);
+        app_state
+            .fs
+            .as_fake()
+            .insert_tree("/project", json!({}))
+            .await;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        db.save_workspace(workspace_with(
+            1,
+            &[Path::new("/project")],
+            pane_with_items(&[100]),
+            None,
+        ))
+        .await;
+        db.write(|conn| conn.exec("DROP TABLE bookmarks")?())
+            .await
+            .unwrap();
+
+        let opened = cx
+            .update(|cx| {
+                crate::Workspace::new_local(
+                    vec![PathBuf::from("/project")],
+                    app_state.clone(),
+                    None,
+                    None,
+                    None,
+                    crate::OpenMode::NewWindow,
+                    cx,
+                )
+            })
+            .await;
+        cx.run_until_parked();
+
+        assert_eq!((opened.is_err(), cx.windows().len()), (true, 0));
+    }
+
+    #[gpui::test]
+    async fn test_corrupt_rows_do_not_fail_recent_workspaces_or_gc(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let fs = fs::FakeFs::new(cx.executor());
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        for id in [1, 2] {
+            db.save_workspace(workspace_with(
+                id,
+                &[Path::new("/project")],
+                empty_pane_group(),
+                Some("previous"),
+            ))
+            .await;
+        }
+        db.write(|conn| {
+            conn.exec("UPDATE workspaces SET paths = CAST(X'FF' AS TEXT) WHERE workspace_id = 2")?()
+        })
+        .await
+        .unwrap();
+
+        let recent_ids = db
+            .recent_workspaces()
+            .map(|rows| rows.into_iter().map(|row| row.0).collect::<Vec<_>>())
+            .ok();
+        let collected = db
+            .garbage_collect_workspaces(
+                fs.as_ref(),
+                "current",
+                &HashSet::default(),
+                WorkspaceIdClaims::default().snapshot(),
+            )
+            .await
+            .is_ok();
+
+        assert_eq!((recent_ids, collected), (Some(vec![WorkspaceId(1)]), true));
+    }
+
+    #[gpui::test]
+    async fn test_undecodable_layout_metadata_degrades_instead_of_failing_restoration() {
+        let db = WorkspaceDb::open_test_db(
+            "test_undecodable_layout_metadata_degrades_instead_of_failing_restoration",
+        )
+        .await;
+        db.save_workspace(workspace_with(
+            1,
+            &[],
+            SerializedPaneGroup::Group {
+                axis: SerializedAxis(Axis::Vertical),
+                flexes: Some(vec![1., 1.]),
+                children: vec![pane_with_items(&[1, 2]), pane_with_items(&[3])],
+            },
+            Some("previous"),
+        ))
+        .await;
+        db.write(|conn| {
+            conn.exec("UPDATE pane_groups SET axis = 'Diagonal', flexes = 'not json'")?()?;
+            conn.exec("UPDATE items SET kind = CAST(X'FF' AS TEXT) WHERE item_id = 2")?()?;
+            conn.exec(
+                "UPDATE workspaces SET window_state = 'Bogus', display = X'0102', \
+                left_dock_active_panel = CAST(X'FF' AS TEXT)",
+            )?()
+        })
+        .await
+        .unwrap();
+
+        let restored = db.workspace_for_id(WorkspaceId(1)).map(|workspace| {
+            (
+                workspace.center_group,
+                workspace.window_bounds,
+                workspace.display,
+                workspace.docks,
+            )
         });
 
         assert_eq!(
-            (first_process, next_process),
-            ([1 << 33, 1 << 33, (1 << 33) | 1], 2 << 33)
+            restored,
+            Some((
+                SerializedPaneGroup::Group {
+                    axis: SerializedAxis(Axis::Horizontal),
+                    flexes: None,
+                    children: vec![
+                        SerializedPaneGroup::Pane(SerializedPane::new(
+                            vec![
+                                SerializedItem::new("Terminal", 1, true, false),
+                                SerializedItem::new("\u{FFFD}", 2, true, false),
+                            ],
+                            true,
+                            0,
+                        )),
+                        pane_with_items(&[3]),
+                    ],
+                },
+                None,
+                None,
+                DockStructure::default(),
+            ))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_persistent_item_ids_are_unique_across_live_items_and_processes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let (first, second, third) = (cx.new(|_| ()), cx.new(|_| ()), cx.new(|_| ()));
+        let claims = cx.update(|cx| {
+            [
+                claim_persistent_item_id(&first, 7, cx),
+                claim_persistent_item_id(&first, 9, cx),
+                persistent_item_id(&first, cx),
+                claim_persistent_item_id(&second, 7, cx),
+                persistent_item_id(&third, cx),
+                persistent_item_id(&second, cx),
+            ]
+        });
+        drop(first);
+        cx.run_until_parked();
+        let fourth = cx.new(|_| ());
+        let after_release = cx.update(|cx| {
+            let reclaimed = claim_persistent_item_id(&fourth, 7, cx);
+            cx.remove_global::<PersistentItemIds>();
+            [reclaimed, persistent_item_id(&fourth, cx)]
+        });
+
+        assert_eq!(
+            (claims, after_release),
+            ([7, 7, 7, 1 << 33, (1 << 33) | 1, 1 << 33], [7, 2 << 33])
         );
     }
 
@@ -5519,7 +7236,7 @@ mod tests {
         }
         workspace.update(cx, |workspace, _| {
             workspace.set_database_id(WorkspaceId(101));
-            workspace.adopted_session_window = Some(SessionWindow {
+            *workspace.adopted_session_window.lock() = Some(SessionWindow {
                 session_id: "previous".to_owned(),
                 window_id: 7,
             });
@@ -5527,7 +7244,7 @@ mod tests {
 
         workspace
             .update_in(cx, |workspace, window, cx| {
-                workspace.remove_from_session(window, cx)
+                workspace.leave_session(window, cx)
             })
             .await;
 
@@ -5579,35 +7296,6 @@ mod tests {
             ),
             ([Some(WorkspaceId(4)), Some(WorkspaceId(5))], None, None)
         );
-    }
-
-    #[gpui::test]
-    async fn test_unreadable_remote_connection_skips_only_its_workspace(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let fs = fs::FakeFs::new(cx.executor());
-        let db =
-            WorkspaceDb::open_test_db("test_unreadable_remote_connection_skips_only_its_workspace")
-                .await;
-        db.save_workspace(workspace_with(1, &[], empty_pane_group(), Some("s")))
-            .await;
-        db.save_workspace(SerializedWorkspace {
-            session_id: Some("s".to_owned()),
-            ..remote_workspace_with(2, "host", &[Path::new("/remote")])
-        })
-        .await;
-        db.write(|conn| conn.exec("UPDATE remote_connections SET kind = 'unknown'")?())
-            .await
-            .unwrap();
-
-        let locations = db
-            .restorable_session_workspace_locations(&["s".to_owned()], None, fs.as_ref())
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|location| location.workspace_id)
-            .collect::<Vec<_>>();
-        assert_eq!(locations, vec![WorkspaceId(1)]);
     }
 
     #[gpui::test]
@@ -5879,41 +7567,369 @@ mod tests {
             WorkspaceDb::open_test_db("test_ssh_connection_arguments_separate_remote_connections")
                 .await;
         db.write(|conn| {
-            conn.exec("INSERT INTO remote_connections (kind, host) VALUES ('ssh', 'host')")?()
+            conn.exec("INSERT INTO remote_connections (kind, host) VALUES ('ssh', 'host')")?()?;
+            conn.exec(
+                "INSERT INTO workspaces (workspace_id, paths, remote_connection_id) VALUES (41, '/legacy', 1)",
+            )?()
         })
         .await
         .unwrap();
-        let ssh = |target: &str| {
+        let ssh = |target: &str, key: &str| {
             RemoteConnectionOptions::Ssh(SshConnectionOptions {
                 host: "host".into(),
-                args: Some(vec!["-o".to_string(), format!("Hostname={target}")]),
+                args: Some(vec![
+                    "-i".to_string(),
+                    key.to_string(),
+                    "-o".to_string(),
+                    format!("Hostname={target}"),
+                ]),
                 ..Default::default()
             })
         };
+        let legacy = RemoteConnectionOptions::Ssh(SshConnectionOptions {
+            host: "host".into(),
+            ..Default::default()
+        });
+
+        let find_workspace = async |root: &str, target: &str, key: &str| {
+            let connections = db
+                .equivalent_remote_connections(ssh(target, key))
+                .await
+                .unwrap();
+            db.remote_workspace_for_roots(&[Path::new(root)], &connections)
+                .map(|workspace| workspace.id)
+        };
 
         let mut ids = Vec::new();
-        for target in ["host-a", "host-b", "host-a"] {
+        for (target, key) in [
+            ("host-a", "/keys/a"),
+            ("host-b", "/keys/b"),
+            ("host-a", "/keys/rotated"),
+            ("host-a", "/keys/a"),
+        ] {
             ids.push(
-                db.get_or_create_remote_connection(ssh(target))
+                db.get_or_create_remote_connection(ssh(target, key))
                     .await
                     .unwrap(),
             );
         }
-        let stored = ids
-            .iter()
-            .map(|id| db.remote_connection(*id).unwrap())
-            .collect::<Vec<_>>();
+        db.save_workspace(SerializedWorkspace {
+            location: SerializedWorkspaceLocation::Remote(ssh("host-a", "/keys/a")),
+            ..remote_workspace_with(7, "host", &[Path::new("/repo")])
+        })
+        .await;
+        let found_after_rotation = find_workspace("/repo", "host-a", "/keys/rotated").await;
+        let found_on_other_target = find_workspace("/repo", "host-b", "/keys/b").await;
+        let legacy_before_resolution = db.remote_connection(RemoteConnectionId(1)).unwrap();
+
+        db.sync_ssh_connections(
+            vec![ConfiguredSshConnection {
+                host: "host".to_string(),
+                username: None,
+                port: None,
+                args: vec![
+                    "-i".to_string(),
+                    "/keys/b".to_string(),
+                    "-o".to_string(),
+                    "Hostname=host-b".to_string(),
+                ],
+            }],
+            SshArgumentRenames::Keep,
+        )
+        .await
+        .unwrap();
+        let legacy_found_on_resolved_target = find_workspace("/legacy", "host-b", "/keys/b").await;
 
         assert_eq!(
-            (ids, stored),
+            (
+                ids,
+                found_after_rotation,
+                found_on_other_target,
+                legacy_before_resolution,
+                legacy_found_on_resolved_target,
+            ),
             (
                 vec![
-                    RemoteConnectionId(1),
                     RemoteConnectionId(2),
-                    RemoteConnectionId(1)
+                    RemoteConnectionId(3),
+                    RemoteConnectionId(4),
+                    RemoteConnectionId(2),
                 ],
-                vec![ssh("host-a"), ssh("host-b"), ssh("host-a")],
+                None,
+                None,
+                legacy,
+                Some(WorkspaceId(41)),
             )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_workspace_reads_wait_for_queued_writes_to_that_workspace(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let db = WorkspaceDb::open_test_db(
+            "test_workspace_reads_wait_for_queued_writes_to_that_workspace",
+        )
+        .await;
+        let root = [Path::new("/root")];
+        db.save_workspace(workspace_with(1, &root, pane_with_items(&[1]), None))
+            .await;
+        let writes = WorkspaceWrites::default();
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let queued_write = cx.background_spawn({
+            let db = db.clone();
+            async move {
+                release_rx.await.ok();
+                db.save_workspace(workspace_with(1, &root, pane_with_items(&[1, 2]), None))
+                    .await;
+            }
+        });
+        writes.record(WorkspaceId(1), queued_write.shared());
+        let read = cx.background_spawn({
+            let db = db.clone();
+            let writes = writes.clone();
+            async move {
+                db.claim_settled_workspace_for_roots(
+                    &root,
+                    None,
+                    |workspace_id| WorkspaceIdClaims::default().try_claim(workspace_id),
+                    &writes,
+                )
+                .await
+                .unwrap()
+                .map(|(workspace, _)| workspace.center_group.item_ids())
+            }
+        });
+        cx.run_until_parked();
+        release_tx.send(()).ok();
+
+        assert_eq!(read.await, Some(vec![1, 2]));
+    }
+
+    #[gpui::test]
+    async fn test_saved_ssh_sessions_follow_edited_settings_entries() {
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+        let configured = |host: &str, key: &str| ConfiguredSshConnection {
+            host: host.to_string(),
+            username: None,
+            port: None,
+            args: vec!["-i".to_string(), key.to_string()],
+        };
+        let ssh = |host: &str, key: &str| {
+            RemoteConnectionOptions::Ssh(SshConnectionOptions {
+                host: host.into(),
+                args: Some(vec!["-i".to_string(), key.to_string()]),
+                ..Default::default()
+            })
+        };
+        let find_workspace = async |host: &str, key: &str| {
+            let connections = db
+                .equivalent_remote_connections(ssh(host, key))
+                .await
+                .unwrap();
+            db.remote_workspace_for_roots(&[Path::new("/repo")], &connections)
+                .map(|workspace| workspace.id)
+        };
+
+        db.sync_ssh_connections(
+            vec![
+                configured("edited", "/old"),
+                configured("shared", "/a"),
+                configured("shared", "/b"),
+            ],
+            SshArgumentRenames::Keep,
+        )
+        .await
+        .unwrap();
+        for (id, host, key) in [(1, "edited", "/old"), (2, "shared", "/b")] {
+            db.save_workspace(SerializedWorkspace {
+                location: SerializedWorkspaceLocation::Remote(ssh(host, key)),
+                ..remote_workspace_with(id, host, &[Path::new("/repo")])
+            })
+            .await;
+        }
+        db.sync_ssh_connections(
+            vec![configured("edited", "/new"), configured("shared", "/a")],
+            SshArgumentRenames::Keep,
+        )
+        .await
+        .unwrap();
+        let after_edit = [
+            find_workspace("edited", "/new").await,
+            find_workspace("edited", "/old").await,
+            find_workspace("shared", "/a").await,
+            find_workspace("shared", "/b").await,
+        ];
+        db.sync_ssh_connections(
+            vec![
+                configured("edited", "/new"),
+                configured("edited", "/old"),
+                configured("shared", "/a"),
+            ],
+            SshArgumentRenames::Keep,
+        )
+        .await
+        .unwrap();
+        let after_readding_old = find_workspace("edited", "/old").await;
+
+        assert_eq!(
+            (after_edit, after_readding_old),
+            (
+                [
+                    Some(WorkspaceId(1)),
+                    Some(WorkspaceId(1)),
+                    None,
+                    Some(WorkspaceId(2)),
+                ],
+                None,
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_stale_ssh_clients_keep_following_many_edited_entries() {
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+        let hosts = (0..=64)
+            .map(|index| format!("host-{index}"))
+            .collect::<Vec<_>>();
+        let configured = |key: &str| {
+            hosts
+                .iter()
+                .map(|host| ConfiguredSshConnection {
+                    host: host.clone(),
+                    username: None,
+                    port: None,
+                    args: vec!["-i".to_string(), key.to_string()],
+                })
+                .collect::<Vec<_>>()
+        };
+        let ssh = |host: &str, key: &str| {
+            RemoteConnectionOptions::Ssh(SshConnectionOptions {
+                host: host.into(),
+                args: Some(vec!["-i".to_string(), key.to_string()]),
+                ..Default::default()
+            })
+        };
+
+        let save_with_key = async |index: usize, key: &str| {
+            db.save_workspace(SerializedWorkspace {
+                location: SerializedWorkspaceLocation::Remote(ssh(&hosts[index], key)),
+                ..remote_workspace_with(index as u64 + 1, &hosts[index], &[Path::new("/repo")])
+            })
+            .await;
+        };
+        let stale_hosts = || {
+            hosts
+                .iter()
+                .enumerate()
+                .filter(|(index, host)| {
+                    db.workspace_for_id(WorkspaceId(*index as i64 + 1))
+                        .map(|workspace| workspace.location)
+                        != Some(SerializedWorkspaceLocation::Remote(ssh(host, "/new")))
+                })
+                .map(|(_, host)| host.clone())
+                .collect::<Vec<_>>()
+        };
+
+        db.sync_ssh_connections(configured("/old"), SshArgumentRenames::Keep)
+            .await
+            .unwrap();
+        for index in 0..hosts.len() {
+            save_with_key(index, "/old").await;
+        }
+        db.sync_ssh_connections(configured("/new"), SshArgumentRenames::Keep)
+            .await
+            .unwrap();
+        save_with_key(0, "/old").await;
+        let after_stale_save = stale_hosts();
+        db.sync_ssh_connections(configured("/new"), SshArgumentRenames::Discard)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (after_stale_save, stale_hosts()),
+            (Vec::<String>::new(), Vec::<String>::new())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_saved_project_groups_follow_edited_ssh_settings_across_restarts() {
+        let db = WorkspaceDb(db::AppDatabase::test_new().0);
+        let configured = |key: &str| {
+            vec![ConfiguredSshConnection {
+                host: "host".to_string(),
+                username: None,
+                port: None,
+                args: vec!["-i".to_string(), key.to_string()],
+            }]
+        };
+        let state_key = multi_workspace_state_key("session", WindowId::from(1u64));
+        let write_state_with_key = async |key: &str| {
+            let state = model::MultiWorkspaceState {
+                project_groups: vec![model::SerializedProjectGroup {
+                    path_list: PathList::new(&["/repo"]).serialize(),
+                    location: SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(
+                        SshConnectionOptions {
+                            host: "host".into(),
+                            args: Some(vec!["-i".to_string(), key.to_string()]),
+                            ..Default::default()
+                        },
+                    )),
+                    expanded: true,
+                }],
+                ..Default::default()
+            };
+            let state_key = state_key.clone();
+            db.write(move |conn| {
+                db::kvp::write_scoped_value(
+                    conn,
+                    MULTI_WORKSPACE_STATE_NAMESPACE,
+                    &state_key,
+                    &serde_json::to_string(&state).unwrap(),
+                )
+            })
+            .await
+            .unwrap();
+        };
+        let saved_group_arguments = async || {
+            let state_key = state_key.clone();
+            let state = db
+                .write(move |conn| {
+                    db::kvp::read_scoped_value(conn, MULTI_WORKSPACE_STATE_NAMESPACE, &state_key)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str::<model::MultiWorkspaceState>(&state)
+                .unwrap()
+                .project_groups
+                .into_iter()
+                .map(|group| match group.location {
+                    SerializedWorkspaceLocation::Remote(RemoteConnectionOptions::Ssh(options)) => {
+                        options.args
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        db.sync_ssh_connections(configured("/old"), SshArgumentRenames::Discard)
+            .await
+            .unwrap();
+        write_state_with_key("/old").await;
+        db.sync_ssh_connections(configured("/new"), SshArgumentRenames::Keep)
+            .await
+            .unwrap();
+        let after_edit = saved_group_arguments().await;
+        write_state_with_key("/old").await;
+        db.sync_ssh_connections(configured("/new"), SshArgumentRenames::Discard)
+            .await
+            .unwrap();
+
+        let new_arguments = Some(vec!["-i".to_string(), "/new".to_string()]);
+        assert_eq!(
+            (after_edit, saved_group_arguments().await),
+            (vec![new_arguments.clone()], vec![new_arguments])
         );
     }
 
@@ -5946,6 +7962,27 @@ mod tests {
                 (WorkspaceId(1), PathList::new(&["/repo"])),
                 (WorkspaceId(2), PathList::new(&["/repo"])),
             ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_saving_a_workspace_keeps_unbound_duplicates_that_hold_items() {
+        let db = WorkspaceDb::open_test_db(
+            "test_saving_a_workspace_keeps_unbound_duplicates_that_hold_items",
+        )
+        .await;
+        let root = [Path::new("/shared")];
+        for workspace in [
+            workspace_with(1, &root, empty_pane_group(), None),
+            workspace_with(2, &root, pane_with_items(&[1]), None),
+            workspace_with(3, &root, empty_pane_group(), Some("session")),
+        ] {
+            db.save_workspace(workspace).await;
+        }
+
+        assert_eq!(
+            [1, 2, 3].map(|id| db.workspace_for_id(WorkspaceId(id)).is_some()),
+            [false, true, true]
         );
     }
 
@@ -6319,7 +8356,9 @@ mod tests {
             },
         ];
 
-        let results = cx.update(|cx| read_serialized_multi_workspaces(session_workspaces, cx));
+        let results = cx
+            .update(|cx| read_serialized_multi_workspaces(session_workspaces, cx))
+            .await;
 
         // Should produce 3 results: window 10, window 20, and the orphan.
         assert_eq!(results.len(), 3);
@@ -6435,7 +8474,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_flush_during_restore_keeps_restored_layout(cx: &mut gpui::TestAppContext) {
+    async fn test_restore_keeps_saved_layout_and_item_ids(cx: &mut gpui::TestAppContext) {
         crate::tests::init_test(cx);
         cx.update(crate::register_serializable_item::<TestItem>);
 
@@ -6477,7 +8516,7 @@ mod tests {
         let restore = workspace.update_in(cx, |workspace, window, cx| {
             crate::open_items(
                 workspace,
-                Some(serialized_workspace),
+                Some(serialized_workspace.clone()),
                 Vec::new(),
                 true,
                 window,
@@ -6528,37 +8567,9 @@ mod tests {
         else {
             panic!("expected a single pane after the restore was dropped");
         };
-        assert_eq!(pane.children, vec![scratch_item]);
-    }
+        assert_eq!(pane.children, vec![scratch_item.clone()]);
 
-    #[gpui::test]
-    async fn test_restored_items_keep_their_saved_ids(cx: &mut gpui::TestAppContext) {
-        crate::tests::init_test(cx);
-        cx.update(crate::register_serializable_item::<TestItem>);
-
-        let fs = fs::FakeFs::new(cx.executor());
-        let project = Project::test(fs.clone(), [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-
-        let db = cx.update(|_, cx| WorkspaceDb::global(cx));
-        let workspace_id = db.next_id().await.unwrap();
-        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
-        let saved_item_id = 7;
-        let serialized_workspace = SerializedWorkspace {
-            id: workspace_id,
-            ..default_workspace::<&Path>(
-                &[],
-                &SerializedPaneGroup::Pane(SerializedPane::new(
-                    vec![SerializedItem::new("TestItem", saved_item_id, true, false)],
-                    true,
-                    0,
-                )),
-            )
-        };
-        db.save_workspace(serialized_workspace.clone()).await;
-
+        cx.update(|_, cx| cx.remove_global::<crate::item::test::PendingTestItemDeserialization>());
         workspace
             .update_in(cx, |workspace, window, cx| {
                 crate::open_items(
@@ -6578,8 +8589,7 @@ mod tests {
                 workspace.flush_serialization(window, cx)
             })
             .await;
-
-        let live_item_ids = workspace.update(cx, |workspace, cx| {
+        let mut live_item_ids = workspace.update(cx, |workspace, cx| {
             workspace
                 .items(cx)
                 .filter_map(|item| item.to_serializable_item_handle(cx))
@@ -6588,45 +8598,15 @@ mod tests {
                 .map(|item| item.persistent_item_id(cx))
                 .collect::<Vec<_>>()
         });
-        let Some(SerializedPaneGroup::Pane(pane)) = db
+        live_item_ids.sort();
+        let mut saved_item_ids = db
             .workspace_for_id(workspace_id)
-            .map(|workspace| workspace.center_group)
-        else {
-            panic!("expected a single restored pane");
-        };
+            .map(|workspace| workspace.center_group.item_ids())
+            .unwrap_or_default();
+        saved_item_ids.sort();
         assert_eq!(
-            (
-                live_item_ids,
-                pane.children
-                    .iter()
-                    .map(|item| item.item_id)
-                    .collect::<Vec<_>>()
-            ),
-            (vec![saved_item_id], vec![saved_item_id])
-        );
-    }
-
-    #[gpui::test]
-    async fn test_claimed_item_ids_are_unique_among_live_items(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-        let (first, second, third) = (cx.new(|_| ()), cx.new(|_| ()), cx.new(|_| ()));
-        let claims = cx.update(|cx| {
-            [
-                claim_persistent_item_id(&first, 7, cx),
-                claim_persistent_item_id(&first, 9, cx),
-                claim_persistent_item_id(&second, 7, cx),
-                claim_persistent_item_id(&third, 7, cx),
-                persistent_item_id(&second, cx),
-            ]
-        });
-        drop(first);
-        cx.run_until_parked();
-        let fourth = cx.new(|_| ());
-        let reclaimed = cx.update(|cx| claim_persistent_item_id(&fourth, 7, cx));
-
-        assert_eq!(
-            (claims, reclaimed),
-            ([7, 7, 1 << 33, (1 << 33) | 1, 1 << 33], 7)
+            (live_item_ids, saved_item_ids),
+            (vec![1, scratch_item.item_id], vec![1, scratch_item.item_id])
         );
     }
 
@@ -6669,86 +8649,27 @@ mod tests {
             )))
         );
     }
-    #[gpui::test]
-    async fn test_cleanup_keeps_items_of_restoring_workspaces(cx: &mut gpui::TestAppContext) {
-        let db =
-            WorkspaceDb::open_test_db("test_cleanup_keeps_items_of_restoring_workspaces").await;
-        db.write(|conn| {
-            conn.exec(sql!(
-                CREATE TABLE restoring_items_test(workspace_id INTEGER, item_id INTEGER);
-            ))?()
-        })
-        .await
-        .unwrap();
-        let workspace = default_workspace::<&Path>(
-            &[],
-            &SerializedPaneGroup::Pane(SerializedPane::new(
-                vec![SerializedItem::new("TestItem", 1, true, false)],
-                true,
-                0,
-            )),
-        );
-        let workspace_id = workspace.id;
-        for item_id in [1, 2] {
-            db.write(move |conn| {
-                conn.exec_bound(sql!(
-                    INSERT INTO restoring_items_test(workspace_id, item_id) VALUES (?, ?);
-                ))?((workspace_id, item_id as ItemId))
-            })
-            .await
-            .unwrap();
-        }
-        let remaining_items = || {
-            db.select_bound::<WorkspaceId, ItemId>(sql!(
-                SELECT item_id FROM restoring_items_test WHERE workspace_id = ? ORDER BY item_id
-            ))
-            .unwrap()(workspace_id)
-            .unwrap()
-        };
-
-        let restoring_items = cx.update(|cx| RestoringItems::global(cx).lease(&workspace));
-        cx.update(|cx| {
-            delete_unloaded_items(Vec::new(), workspace_id, "restoring_items_test", &db, cx)
-        })
-        .await
-        .unwrap();
-        let remaining_while_restoring = remaining_items();
-        drop(restoring_items);
-        cx.update(|cx| {
-            delete_unloaded_items(Vec::new(), workspace_id, "restoring_items_test", &db, cx)
-        })
-        .await
-        .unwrap();
-
-        assert_eq!(
-            (remaining_while_restoring, remaining_items()),
-            (vec![1], Vec::new())
-        );
-    }
 
     #[gpui::test]
-    async fn test_cleanup_keeps_items_alive_outside_the_cleaning_container(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn test_cleanup_keeps_saved_restoring_and_live_items(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-        let db = WorkspaceDb::open_test_db(
-            "test_cleanup_keeps_items_alive_outside_the_cleaning_container",
-        )
-        .await;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
         db.write(|conn| {
             conn.exec(sql!(
-                CREATE TABLE live_items_test(workspace_id INTEGER, item_id INTEGER);
+                CREATE TABLE cleanup_items_test(workspace_id INTEGER, item_id INTEGER);
             ))?()
         })
         .await
         .unwrap();
         let workspace_id = WorkspaceId(1);
+        db.save_workspace(workspace_with(1, &[], pane_with_items(&[1]), None))
+            .await;
         let live_item = cx.new(|_| ());
         let live_item_id = cx.update(|cx| persistent_item_id(&live_item, cx));
-        for item_id in [live_item_id, 2] {
+        for item_id in [1, 2, 3, live_item_id] {
             db.write(move |conn| {
                 conn.exec_bound(sql!(
-                    INSERT INTO live_items_test(workspace_id, item_id) VALUES (?, ?);
+                    INSERT INTO cleanup_items_test(workspace_id, item_id) VALUES (?, ?);
                 ))?((workspace_id, item_id))
             })
             .await
@@ -6756,94 +8677,32 @@ mod tests {
         }
         let remaining_items = || {
             db.select_bound::<WorkspaceId, ItemId>(sql!(
-                SELECT item_id FROM live_items_test WHERE workspace_id = ? ORDER BY item_id
+                SELECT item_id FROM cleanup_items_test WHERE workspace_id = ? ORDER BY item_id
             ))
             .unwrap()(workspace_id)
             .unwrap()
         };
-
-        cx.update(|cx| delete_unloaded_items(Vec::new(), workspace_id, "live_items_test", &db, cx))
-            .await
-            .unwrap();
-        let remaining_while_alive = remaining_items();
-        drop(live_item);
-        cx.run_until_parked();
-        cx.update(|cx| delete_unloaded_items(Vec::new(), workspace_id, "live_items_test", &db, cx))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            (remaining_while_alive, remaining_items()),
-            (vec![live_item_id], Vec::new())
-        );
-    }
-
-    #[gpui::test]
-    async fn test_cleanup_keeps_items_referenced_by_the_saved_layout(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let db =
-            WorkspaceDb::open_test_db("test_cleanup_keeps_items_referenced_by_the_saved_layout")
-                .await;
-        db.write(|conn| {
-            conn.exec(sql!(
-                CREATE TABLE layout_items_test(workspace_id INTEGER, item_id INTEGER);
-            ))?()
-        })
-        .await
-        .unwrap();
-        let workspace = workspace_with(1, &[], pane_with_items(&[1]), None);
-        db.save_workspace(workspace).await;
-        for item_id in [1, 2] {
-            db.write(move |conn| {
-                conn.exec_bound(sql!(
-                    INSERT INTO layout_items_test(workspace_id, item_id) VALUES (?, ?);
-                ))?((WorkspaceId(1), item_id as ItemId))
-            })
-            .await
-            .unwrap();
-        }
+        let restoring = cx.update(|cx| {
+            RestoringItems::global(cx).lease(&workspace_with(1, &[], pane_with_items(&[2]), None))
+        });
 
         cx.update(|cx| {
-            delete_unloaded_items(Vec::new(), WorkspaceId(1), "layout_items_test", &db, cx)
+            delete_unloaded_items(Vec::new(), workspace_id, "cleanup_items_test", &db, cx)
+        })
+        .await
+        .unwrap();
+        let remaining_while_referenced = remaining_items();
+        drop((restoring, live_item));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            delete_unloaded_items(Vec::new(), workspace_id, "cleanup_items_test", &db, cx)
         })
         .await
         .unwrap();
 
-        let remaining_items = db
-            .select_bound::<WorkspaceId, ItemId>(sql!(
-                SELECT item_id FROM layout_items_test WHERE workspace_id = ? ORDER BY item_id
-            ))
-            .unwrap()(WorkspaceId(1))
-        .unwrap();
-        assert_eq!(remaining_items, vec![1]);
-    }
-
-    #[test]
-    fn test_unrestored_items_are_kept_for_the_retention_period() {
-        let now = 1_000_000_000;
-        let day = chrono::Duration::days(1).num_seconds();
-        let item = |item_id, unrestored_since| SerializedItem {
-            unrestored_since,
-            ..SerializedItem::new("Terminal", item_id, false, false)
-        };
-        let pane = SerializedPane::new(
-            vec![
-                item(1, None),
-                item(2, Some(now - 6 * day)),
-                item(3, Some(now - 7 * day)),
-            ],
-            true,
-            2,
-        );
-
         assert_eq!(
-            pane.unrestored(&[None, None, None], now),
-            Some(SerializedPane::new(
-                vec![item(1, Some(now)), item(2, Some(now - 6 * day))],
-                true,
-                2,
-            ))
+            (remaining_while_referenced, remaining_items()),
+            (vec![1, 2, live_item_id], vec![1])
         );
     }
 
@@ -7239,7 +9098,7 @@ mod tests {
                 })
             })
             .await;
-        let bound_before_detach = session_binds(&db, &session_id, workspace2_db_id);
+        let bound_before_detach = session_binding(&db, workspace2_db_id).0;
 
         multi_workspace.update_in(cx, |_, window, cx| {
             workspace2.update(cx, |workspace, cx| {
@@ -7258,9 +9117,68 @@ mod tests {
         assert_eq!(
             (
                 bound_before_detach,
-                session_binds(&db, &session_id, workspace2_db_id)
+                session_binding(&db, workspace2_db_id).0
             ),
-            (true, false)
+            (Some(session_id), None)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_replaced_workspace_does_not_persist_discarded_items(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        crate::tests::init_test(cx);
+        cx.update(|cx| {
+            crate::register_serializable_item::<TestItem>(cx);
+            <project::DisableAiSettings as settings::Settings>::override_global(
+                project::DisableAiSettings { disable_ai: true },
+                cx,
+            );
+        });
+        let fs = fs::FakeFs::new(cx.executor());
+        let notes = unique_test_dir(&fs, "replaced-notes").await;
+        let note = notes.join("note.txt");
+        fs.insert_file(&note, Vec::new()).await;
+        let other = unique_test_dir(&fs, "replacement").await;
+        let project = Project::test(fs.clone(), [note.as_path()], cx).await;
+        let db = cx.update(|cx| WorkspaceDb::global(cx));
+        let workspace_id = db.next_id().await.unwrap();
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_dirty(true)
+                .with_buffer_kind(crate::item::ItemBufferKind::Singleton)
+                .with_serialize(|| Some(Task::ready(Ok(()))))
+        });
+        multi_workspace
+            .update_in(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.set_database_id(workspace_id);
+                    workspace.add_item_to_active_pane(Box::new(item), None, true, window, cx);
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .await;
+        let saved_before = saved_center_item_count(&db, workspace_id);
+
+        let open = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            multi_workspace.open_project(vec![other], crate::OpenMode::Activate, window, cx)
+        });
+        cx.run_until_parked();
+        cx.simulate_prompt_answer("Don't Save");
+        let opened = open.await.unwrap();
+        cx.run_until_parked();
+
+        assert_eq!(
+            (
+                saved_before,
+                opened != workspace,
+                saved_center_item_count(&db, workspace_id)
+            ),
+            (1, true, 0)
         );
     }
 
@@ -8072,7 +9990,10 @@ mod tests {
         let recents = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
         assert_eq!(recents.len(), 1);
 
-        let deleted = db.delete_recent_workspace_group(&recents[0]).await.unwrap();
+        let deleted = db
+            .delete_recent_workspace_group(&recents[0], WorkspaceIdClaims::default())
+            .await
+            .unwrap();
         assert_eq!(deleted, vec![WorkspaceId(2), WorkspaceId(1)]);
 
         let recents = db.recent_project_workspaces(fs.as_ref()).await.unwrap();
@@ -8183,8 +10104,9 @@ mod tests {
             "Should have at least one session workspace"
         );
 
-        let multi_workspaces =
-            cx.update(|_, cx| read_serialized_multi_workspaces(session_workspaces, cx));
+        let multi_workspaces = cx
+            .update(|_, cx| read_serialized_multi_workspaces(session_workspaces, cx))
+            .await;
         assert_eq!(
             multi_workspaces.len(),
             1,
@@ -8438,11 +10360,13 @@ mod tests {
             .restorable_session_workspace_locations(
                 &["newest".to_owned(), "older".to_owned()],
                 None,
+                &HashSet::default(),
                 fs,
             )
             .await
             .unwrap();
         cx.update(|cx| read_serialized_multi_workspaces(locations, cx))
+            .await
             .into_iter()
             .map(|window| {
                 (
@@ -8454,10 +10378,39 @@ mod tests {
             .collect()
     }
 
-    fn session_binds(db: &WorkspaceDb, session_id: &str, workspace_id: WorkspaceId) -> bool {
-        db.session_workspaces(session_id.to_owned())
-            .unwrap()
-            .into_iter()
-            .any(|(bound_workspace_id, ..)| bound_workspace_id == workspace_id)
+    fn session_binding(
+        db: &WorkspaceDb,
+        workspace_id: WorkspaceId,
+    ) -> (Option<String>, Option<u64>) {
+        db.select_row_bound::<WorkspaceId, (Option<String>, Option<u64>)>(
+            "SELECT session_id, window_id FROM workspaces WHERE workspace_id = ?",
+        )
+        .unwrap()(workspace_id)
+        .unwrap()
+        .unwrap_or_default()
+    }
+
+    async fn restored_unavailable_roots(
+        db: &WorkspaceDb,
+        workspace_id: WorkspaceId,
+        fs: &dyn Fs,
+    ) -> Option<Vec<PathBuf>> {
+        let serialized_workspace = db.workspace_for_id(workspace_id)?;
+        Some(
+            crate::UnavailableRestoredRoots::detect(&serialized_workspace, &[], fs, db)
+                .await
+                .roots,
+        )
+    }
+
+    fn saved_center_item_count(db: &WorkspaceDb, workspace_id: WorkspaceId) -> usize {
+        fn count(group: &SerializedPaneGroup) -> usize {
+            match group {
+                SerializedPaneGroup::Pane(pane) => pane.children.len(),
+                SerializedPaneGroup::Group { children, .. } => children.iter().map(count).sum(),
+            }
+        }
+        db.workspace_for_id(workspace_id)
+            .map_or(0, |workspace| count(&workspace.center_group))
     }
 }

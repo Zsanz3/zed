@@ -5609,6 +5609,13 @@ impl Panel for OutlinePanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
+    fn flush_serialization(&mut self, _: &Workspace, cx: &mut Context<Self>) -> Task<()> {
+        let pending = std::mem::replace(&mut self.pending_serialization, Task::ready(None));
+        cx.background_spawn(async move {
+            pending.await;
+        })
+    }
+
     fn set_position(&mut self, position: DockPosition, _: &mut Window, cx: &mut Context<Self>) {
         settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
             let dock = match position {

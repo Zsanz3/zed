@@ -10,8 +10,8 @@ use db::kvp::KeyValueStore;
 use gpui::{
     Action, Anchor, AnyView, App, Axis, Context, Entity, EntityId, EventEmitter, FocusHandle,
     Focusable, IntoElement, KeyContext, MouseButton, MouseDownEvent, MouseUpEvent, ParentElement,
-    Render, SharedString, StyleRefinement, Styled, Subscription, WeakEntity, Window, deferred, div,
-    px,
+    Render, SharedString, StyleRefinement, Styled, Subscription, Task, WeakEntity, Window,
+    deferred, div, px,
 };
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore, TerminalDockPosition};
@@ -101,6 +101,9 @@ pub trait Panel: Focusable + EventEmitter<PanelEvent> + Render + Sized {
     fn hide_button_setting(&self, _: &App) -> Option<HideStatusItem> {
         None
     }
+    fn flush_serialization(&mut self, _workspace: &Workspace, _cx: &mut Context<Self>) -> Task<()> {
+        Task::ready(())
+    }
 }
 
 pub trait PanelHandle: Send + Sync {
@@ -134,6 +137,7 @@ pub trait PanelHandle: Send + Sync {
     fn enabled(&self, cx: &App) -> bool;
     fn is_agent_panel(&self, cx: &App) -> bool;
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem>;
+    fn flush_serialization(&self, workspace: &Workspace, cx: &mut App) -> Task<()>;
     fn move_to_next_position(&self, window: &mut Window, cx: &mut App) {
         let current_position = self.position(window, cx);
         let next_position = [
@@ -269,6 +273,10 @@ where
 
     fn hide_button_setting(&self, cx: &App) -> Option<HideStatusItem> {
         self.read(cx).hide_button_setting(cx)
+    }
+
+    fn flush_serialization(&self, workspace: &Workspace, cx: &mut App) -> Task<()> {
+        self.update(cx, |this, cx| this.flush_serialization(workspace, cx))
     }
 }
 
@@ -516,6 +524,13 @@ impl Dock {
 
     fn resizable(&self, cx: &App) -> bool {
         !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
+    }
+
+    pub(crate) fn panel_handles(&self) -> Vec<Arc<dyn PanelHandle>> {
+        self.panel_entries
+            .iter()
+            .map(|entry| entry.panel.clone())
+            .collect()
     }
 
     pub fn panel<T: Panel>(&self) -> Option<Entity<T>> {

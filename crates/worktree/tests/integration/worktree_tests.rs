@@ -6390,6 +6390,81 @@ async fn test_single_file_worktree_deleted(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_folder_worktree_deleted(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.background_executor.clone());
+    fs.insert_tree("/root", json!({ "dir": { "test.txt": "content" } }))
+        .await;
+    let tree = Worktree::local(
+        Path::new("/root/dir"),
+        true,
+        fs.clone(),
+        Default::default(),
+        true,
+        WorktreeId::from_proto(0),
+        &mut cx.to_async(),
+    )
+    .await
+    .unwrap();
+    cx.read(|cx| tree.read(cx).as_local().unwrap().scan_complete())
+        .await;
+    let deleted_events = Rc::new(Cell::new(0));
+    let _subscription = cx.update({
+        let deleted_events = deleted_events.clone();
+        |cx| {
+            cx.subscribe(&tree, move |_, event, _| {
+                if matches!(event, Event::Deleted) {
+                    deleted_events.set(deleted_events.get() + 1);
+                }
+            })
+        }
+    });
+
+    fs.remove_file(Path::new("/root/dir/test.txt"), RemoveOptions::default())
+        .await
+        .unwrap();
+    cx.background_executor.run_until_parked();
+    let after_child_removal = deleted_events.get();
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::Other,
+    ] {
+        fs.set_path_error("/root/dir", Some(kind));
+        cx.background_executor
+            .advance_clock(worktree::ROOT_PATH_CHECK_INTERVAL * 2);
+        cx.background_executor.run_until_parked();
+    }
+    fs.set_path_error("/root/dir", None);
+    cx.background_executor
+        .advance_clock(worktree::ROOT_PATH_CHECK_INTERVAL * 2);
+    cx.background_executor.run_until_parked();
+    let while_inaccessible = deleted_events.get();
+    fs.remove_dir(
+        Path::new("/root/dir"),
+        RemoveOptions {
+            recursive: true,
+            ignore_if_not_exists: false,
+        },
+    )
+    .await
+    .unwrap();
+    cx.background_executor.run_until_parked();
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.background_executor.run_until_parked();
+
+    assert_eq!(
+        (
+            after_child_removal,
+            while_inaccessible,
+            deleted_events.get() > 0,
+            tree.read_with(cx, |tree, _| tree.abs_path().to_path_buf())
+        ),
+        (0, 0, true, PathBuf::from("/root/dir"))
+    );
+}
+
+#[gpui::test]
 async fn test_root_ancestor_rename_is_detected_without_fs_events(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.background_executor.clone());

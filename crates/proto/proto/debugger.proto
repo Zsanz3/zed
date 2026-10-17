@@ -28,12 +28,21 @@ message BreakpointsForFile {
   uint64 project_id = 1;
   string path = 2;
   repeated Breakpoint breakpoints = 3;
+  uint64 version = 4;
 }
 
 message ToggleBreakpoint {
   uint64 project_id = 1;
   string path = 2;
   Breakpoint breakpoint = 3;
+  BreakpointEdit edit = 4;
+}
+
+enum BreakpointEdit {
+  Toggle = 0;
+  Set = 1;
+  Remove = 2;
+  Superseded = 3;
 }
 
 enum DapThreadStatus {

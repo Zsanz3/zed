@@ -3612,7 +3612,7 @@ impl FromAnchor for usize {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LineEnding {
     Unix,
     Windows,

@@ -570,6 +570,7 @@ async fn test_find_or_create_local_workspace_reuses_active_workspace_when_sideba
                 PathList::new(&[PathBuf::from("/root_a")]),
                 None,
                 None,
+                None,
                 OpenMode::Activate,
                 None,
                 window,
@@ -794,6 +795,7 @@ async fn test_find_or_create_local_workspace_reuses_active_workspace_after_sideb
         .update_in(cx, |mw, window, cx| {
             mw.find_or_create_local_workspace(
                 PathList::new(&[PathBuf::from("/root_a")]),
+                None,
                 None,
                 None,
                 OpenMode::Activate,

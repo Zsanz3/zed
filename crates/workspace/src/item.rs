@@ -437,7 +437,7 @@ pub trait SerializableItem: Item {
 }
 
 pub trait SerializableItemHandle: ItemHandle {
-    fn serialized_item_kind(&self) -> &'static str;
+    fn serialized_item_kind(&self, cx: &App) -> SharedString;
     fn persistent_item_id(&self, cx: &mut App) -> ItemId;
     fn serialize(
         &self,
@@ -452,8 +452,8 @@ impl<T> SerializableItemHandle for Entity<T>
 where
     T: SerializableItem,
 {
-    fn serialized_item_kind(&self) -> &'static str {
-        T::serialized_item_kind()
+    fn serialized_item_kind(&self, _cx: &App) -> SharedString {
+        SharedString::new_static(T::serialized_item_kind())
     }
 
     fn persistent_item_id(&self, cx: &mut App) -> ItemId {
@@ -1463,6 +1463,10 @@ pub mod test {
 
     impl Global for FailingTestItemDeserialization {}
 
+    pub struct FailingTestItemSerialization;
+
+    impl Global for FailingTestItemSerialization {}
+
     pub struct TestProjectItem {
         pub entry_id: Option<ProjectEntryId>,
         pub project_path: Option<ProjectPath>,
@@ -1922,8 +1926,11 @@ pub mod test {
             _workspace: &mut Workspace,
             _item_id: ItemId,
             _closing: bool,
-            _cx: &mut Context<Self>,
+            cx: &mut Context<Self>,
         ) -> Option<Task<anyhow::Result<()>>> {
+            if cx.has_global::<FailingTestItemSerialization>() {
+                return Some(Task::ready(Err(anyhow::anyhow!("the disk is full"))));
+            }
             if let Some(serialize) = self.serialize.take() {
                 let result = serialize();
                 self.serialize = Some(serialize);

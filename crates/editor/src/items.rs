@@ -4,22 +4,26 @@ use crate::{
     ReportEditorEvent, SelectionEffects, ToPoint as _,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
-    persistence::{EditorDb, SerializedEditor},
+    persistence::{DeletedFile, EditorDb, SerializedEditor, TextFormat},
     scroll::{ScrollAnchor, ScrollOffset},
 };
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet};
 use file_icons::FileIcons;
 use fs::MTime;
-use futures::{channel::oneshot, future::try_join_all};
+use futures::{
+    FutureExt as _,
+    channel::oneshot,
+    future::{Shared, try_join_all},
+};
 use git::status::GitSummary;
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, Font, Global,
     IntoElement, ParentElement, Pixels, SharedString, Styled, Task, WeakEntity, Window, point,
 };
 use language::{
-    Bias, Buffer, BufferRow, CharKind, CharScopeContext, HighlightedText, LocalFile, PLAIN_TEXT,
-    Point, SelectionGoal,
+    Bias, Buffer, BufferRow, CharKind, CharScopeContext, DiskState, HighlightedText, Language,
+    LocalFile, PLAIN_TEXT, Point, SelectionGoal,
     language_settings::{FormatOnSave, LanguageSettings},
     proto::serialize_anchor as serialize_text_anchor,
 };
@@ -61,6 +65,7 @@ use workspace::{
         Direction, FilteredSearchRange, SearchEvent, SearchToken, SearchableItem,
         SearchableItemHandle, SelectSearchOptions,
     },
+    unrestored_item_view::RestorationFailure,
 };
 use workspace::{
     Pane, TabBarSettings, WorkspaceSettings,
@@ -911,7 +916,7 @@ impl Item for Editor {
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
-        self.buffer().read(cx).read(cx).is_dirty()
+        self.buffer().read(cx).read(cx).is_dirty() || recovered_source_path(self, cx).is_some()
     }
 
     fn capability(&self, cx: &App) -> Capability {
@@ -1305,10 +1310,9 @@ impl SerializableItem for Editor {
                 } else {
                     SerializedEditor {
                         abs_path: serialized_editor.abs_path,
-                        contents: None,
-                        language: None,
-                        mtime: None,
-                        recovered_from: None,
+                        deleted_file: serialized_editor.deleted_file,
+                        text_format: serialized_editor.text_format,
+                        ..SerializedEditor::default()
                     }
                 }
             }
@@ -1325,152 +1329,104 @@ impl SerializableItem for Editor {
             "Deserialized editor {item_id:?} in workspace {workspace_id:?}, {serialized_editor:?}"
         );
 
-        match serialized_editor {
-            SerializedEditor {
-                abs_path: None,
-                contents: Some(contents),
-                language,
-                recovered_from,
-                ..
-            } => window.spawn(cx, {
-                let project = project.clone();
-                async move |cx| {
-                    let content_language_detection_enabled = language.is_none();
-                    let language_registry =
-                        project.read_with(cx, |project, _| project.languages().clone());
-
-                    let language = if let Some(language_name) = language {
-                        // We don't fail here, because we'd rather not set the language if the name changed
-                        // than fail to restore the buffer.
-                        language_registry
-                            .language_for_name(&language_name)
-                            .await
-                            .ok()
-                    } else {
-                        None
-                    };
-
-                    // First create the empty buffer
-                    let buffer = project
-                        .update(cx, |project, cx| project.create_buffer(language, true, cx))
+        window.spawn(cx, async move |cx| {
+            let (buffer, recovered_from) = match serialized_editor {
+                SerializedEditor {
+                    abs_path: Some(abs_path),
+                    contents,
+                    language,
+                    mtime,
+                    deleted_file,
+                    text_format,
+                    ..
+                } => {
+                    // Open the buffer directly via the project rather than through
+                    // workspace.open_abs_path(), which has the side effect of adding
+                    // the item to a pane. The caller (deserialize_to) will add the
+                    // returned item to the correct pane.
+                    let opened_buffer = project
+                        .update(cx, |project, cx| project.open_local_buffer(&abs_path, cx))
                         .await
-                        .context("Failed to create buffer while deserializing editor")?;
-
-                    // Then set the text so that the dirty bit is set correctly
-                    buffer.update(cx, |buffer, cx| {
-                        if content_language_detection_enabled {
-                            buffer.set_content_language_detection_enabled(true);
+                        .with_context(|| format!("Failed to open buffer for {abs_path:?}"));
+                    match (opened_buffer, contents) {
+                        (Ok(buffer), contents) => {
+                            restore_file_buffer(
+                                &project,
+                                buffer,
+                                &abs_path,
+                                SavedFileBuffer {
+                                    contents,
+                                    mtime,
+                                    deleted_file,
+                                    text_format,
+                                },
+                                cx,
+                            )
+                            .await?
                         }
-                        buffer.set_language_registry(language_registry);
-                        buffer.set_text(contents, cx);
-                        if let Some(entry) = buffer.peek_undo_stack() {
-                            buffer.forget_transaction(entry.transaction_id());
+                        (Err(error), None) => {
+                            return Err(error.context(restoration_failure(&abs_path)));
                         }
-                    });
-
-                    cx.update(|window, cx| {
-                        cx.new(|cx| {
-                            let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
-                            editor.recovered_from = recovered_from;
-                            editor.read_metadata_from_db(item_id, workspace_id, window, cx);
-                            editor
-                        })
-                    })
-                }
-            }),
-            SerializedEditor {
-                abs_path: Some(abs_path),
-                contents,
-                mtime,
-                ..
-            } => {
-                let opened_buffer = project.update(cx, |project, cx| {
-                    let (worktree, path) = project.find_worktree(&abs_path, cx)?;
-                    let project_path = ProjectPath {
-                        worktree_id: worktree.read(cx).id(),
-                        path: path,
-                    };
-                    Some(project.open_path(project_path, cx))
-                });
-
-                match opened_buffer {
-                    Some(opened_buffer) => window.spawn(cx, async move |cx| {
-                        let (_, buffer) = opened_buffer
-                            .await
-                            .context("Failed to open path in project")?;
-                        let (buffer, recovered_from) = restore_buffer_contents(
-                            &project, buffer, &abs_path, contents, mtime, cx,
-                        )
-                        .await?;
-
-                        cx.update(|window, cx| {
-                            cx.new(|cx| {
-                                let mut editor =
-                                    Editor::for_buffer(buffer, Some(project), window, cx);
-                                editor.recovered_from = recovered_from;
-                                editor.read_metadata_from_db(item_id, workspace_id, window, cx);
-                                editor
-                            })
-                        })
-                    }),
-                    None => {
-                        // File is not in any worktree (e.g., opened as a standalone file).
-                        // Open the buffer directly via the project rather than through
-                        // workspace.open_abs_path(), which has the side effect of adding
-                        // the item to a pane. The caller (deserialize_to) will add the
-                        // returned item to the correct pane.
-                        window.spawn(cx, async move |cx| {
-                            let buffer = project
-                                .update(cx, |project, cx| project.open_local_buffer(&abs_path, cx))
-                                .await
-                                .with_context(|| {
-                                    format!("Failed to open buffer for {abs_path:?}")
-                                })?;
-                            let (buffer, recovered_from) = restore_buffer_contents(
-                                &project, buffer, &abs_path, contents, mtime, cx,
+                        (Err(error), Some(contents)) => {
+                            log::warn!(
+                                "Restoring the unsaved contents of {abs_path:?} detached from the file: {error:#}"
+                            );
+                            let language = saved_language(&project, language, cx).await;
+                            let buffer = recovered_buffer(
+                                &project,
+                                &abs_path,
+                                language,
+                                contents,
+                                text_format,
+                                cx,
                             )
                             .await?;
-
-                            cx.update(|window, cx| {
-                                cx.new(|cx| {
-                                    let mut editor =
-                                        Editor::for_buffer(buffer, Some(project), window, cx);
-                                    editor.recovered_from = recovered_from;
-                                    editor.read_metadata_from_db(item_id, workspace_id, window, cx);
-                                    editor
-                                })
-                            })
-                        })
+                            (buffer, Some(abs_path))
+                        }
                     }
                 }
-            }
-            SerializedEditor {
-                abs_path: None,
-                contents: None,
-                language,
-                recovered_from,
-                ..
-            } => window.spawn(cx, async move |cx| {
-                let buffer = project
-                    .update(cx, |project, cx| project.create_buffer(None, true, cx))
-                    .await
-                    .context("Failed to create buffer")?;
-                if language.is_none() {
-                    buffer.update(cx, |buffer, _| {
-                        buffer.set_content_language_detection_enabled(true);
+                SerializedEditor {
+                    abs_path: None,
+                    contents,
+                    language,
+                    recovered_from,
+                    shared_buffer,
+                    text_format,
+                    ..
+                } => {
+                    let detect_language = language.is_none();
+                    let language = saved_language(&project, language, cx).await;
+                    let key = shared_buffer.map(|buffer| RestoredBufferKey::Shared {
+                        project: project.entity_id(),
+                        workspace_id,
+                        buffer,
+                        contents: contents.clone(),
+                        text_format,
                     });
+                    let buffer = restored_buffer(
+                        &project,
+                        key,
+                        language,
+                        detect_language,
+                        contents,
+                        text_format,
+                        cx,
+                    )
+                    .await
+                    .context("Failed to create buffer while deserializing editor")?;
+                    (buffer, recovered_from)
                 }
+            };
 
-                cx.update(|window, cx| {
-                    cx.new(|cx| {
-                        let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
-                        editor.recovered_from = recovered_from;
-                        editor.read_metadata_from_db(item_id, workspace_id, window, cx);
-                        editor
-                    })
+            cx.update(|window, cx| {
+                cx.new(|cx| {
+                    let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
+                    editor.recovered_from = recovered_from;
+                    editor.read_metadata_from_db(item_id, workspace_id, window, cx);
+                    editor
                 })
-            }),
-        }
+            })
+        })
     }
 
     fn serialize(
@@ -1511,11 +1467,29 @@ impl SerializableItem for Editor {
                 })
         });
 
-        let recovered_from = self
-            .recovered_from
-            .clone()
-            .filter(|_| buffer.read(cx).file().is_none());
-        let is_dirty = buffer.read(cx).is_dirty();
+        let recovered_from = recovered_source_path(self, cx).map(Path::to_path_buf);
+        let shared_buffer = workspace
+            .session_id()
+            .filter(|_| buffer.read(cx).file().is_none())
+            .map(|session_id| {
+                let buffer_entity_id = buffer.entity_id().as_u64();
+                format!("{session_id}/{buffer_entity_id}")
+            });
+        let (deleted_file, preserve_contents, text_format) = {
+            let buffer = buffer.read(cx);
+            let deleted_file = buffer
+                .file()
+                .filter(|file| file.disk_state() == DiskState::Deleted)
+                .map(|_| DeletedFile {
+                    dirty: buffer.is_dirty(),
+                    read_only: buffer.read_only(),
+                });
+            let preserve_contents =
+                buffer.is_dirty() || (deleted_file.is_some() && !buffer.is_empty());
+            let text_format =
+                (preserve_contents || deleted_file.is_some()).then(|| TextFormat::of(buffer));
+            (deleted_file, preserve_contents, text_format)
+        };
         let mtime = buffer.read(cx).saved_mtime();
         let content_language_detection_enabled =
             buffer.read(cx).content_language_detection_enabled();
@@ -1524,7 +1498,7 @@ impl SerializableItem for Editor {
 
         let db = EditorDb::global(cx);
         Some(cx.background_spawn(async move {
-            let (contents, language) = if serialize_dirty_buffers && is_dirty {
+            let (contents, language) = if serialize_dirty_buffers && preserve_contents {
                 let contents = snapshot.text();
                 let language = snapshot.language().and_then(|language| {
                     if content_language_detection_enabled && *language == *PLAIN_TEXT {
@@ -1544,6 +1518,9 @@ impl SerializableItem for Editor {
                 language,
                 mtime,
                 recovered_from,
+                shared_buffer,
+                deleted_file,
+                text_format,
             };
             log::debug!("Serializing editor {item_id:?} in workspace {workspace_id:?}");
             db.save_serialized_editor(item_id, workspace_id, editor)
@@ -2300,10 +2277,10 @@ fn tab_title<'a>(editor: &Editor, cx: &'a App) -> Cow<'a, str> {
 
 fn recovered_source_path<'a>(editor: &'a Editor, cx: &App) -> Option<&'a Path> {
     let buffer = editor.buffer.read(cx).as_singleton()?;
-    if buffer.read(cx).file().is_some() {
-        return None;
-    }
-    editor.recovered_from.as_deref()
+    editor
+        .recovered_from
+        .as_deref()
+        .filter(|_| buffer.read(cx).file().is_none())
 }
 
 fn path_for_buffer<'a>(
@@ -2358,98 +2335,393 @@ fn path_for_file<'a>(
     }
 }
 
+struct SavedFileBuffer {
+    contents: Option<String>,
+    mtime: Option<MTime>,
+    deleted_file: Option<DeletedFile>,
+    text_format: Option<TextFormat>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDiskState {
+    Present,
+    New,
+    Deleted,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiveFileBuffer {
+    disk_state: LiveDiskState,
+    has_unsaved_edits: bool,
+    has_saved_snapshot: bool,
+    has_saved_encoding: bool,
+}
+
+impl LiveFileBuffer {
+    fn new(buffer: &Buffer, saved: &SavedFileBuffer) -> Self {
+        let disk_state = match buffer.file().map(|file| file.disk_state()) {
+            Some(DiskState::New) => LiveDiskState::New,
+            Some(DiskState::Deleted) => LiveDiskState::Deleted,
+            Some(DiskState::Present { .. } | DiskState::Historic { .. }) | None => {
+                LiveDiskState::Present
+            }
+        };
+        Self {
+            disk_state,
+            has_unsaved_edits: buffer.has_unsaved_edits(),
+            has_saved_snapshot: saved.contents.as_deref().is_some_and(|contents| {
+                holds_snapshot(buffer, contents, saved.text_format.as_ref())
+            }),
+            has_saved_encoding: saved
+                .text_format
+                .is_none_or(|text_format| buffer.encoding() == text_format.encoding),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum FileBufferRestoration {
+    UseLive,
+    Recover,
+    Overwrite,
+    RestoreDeleted,
+    Redecode,
+}
+
+fn plan_file_buffer_restoration(
+    saved: &SavedFileBuffer,
+    live: LiveFileBuffer,
+) -> FileBufferRestoration {
+    let has_contents_to_recover = saved.contents.is_some() && !live.has_saved_snapshot;
+    if live.has_unsaved_edits {
+        return if has_contents_to_recover {
+            FileBufferRestoration::Recover
+        } else {
+            FileBufferRestoration::UseLive
+        };
+    }
+    match (saved.deleted_file, live.disk_state) {
+        (Some(_), LiveDiskState::New) => FileBufferRestoration::RestoreDeleted,
+        (Some(_), LiveDiskState::Deleted) => {
+            if has_contents_to_recover {
+                FileBufferRestoration::Recover
+            } else {
+                FileBufferRestoration::UseLive
+            }
+        }
+        (Some(deleted_file), LiveDiskState::Present) if !deleted_file.dirty => {
+            if live.has_saved_encoding {
+                FileBufferRestoration::UseLive
+            } else {
+                FileBufferRestoration::Redecode
+            }
+        }
+        _ if saved.contents.is_some() => FileBufferRestoration::Overwrite,
+        _ => FileBufferRestoration::UseLive,
+    }
+}
+
+async fn restore_file_buffer(
+    project: &Entity<Project>,
+    buffer: Entity<Buffer>,
+    abs_path: &Path,
+    saved: SavedFileBuffer,
+    cx: &mut AsyncWindowContext,
+) -> Result<(Entity<Buffer>, Option<PathBuf>)> {
+    let plan = buffer.read_with(cx, |buffer, _| {
+        plan_file_buffer_restoration(&saved, LiveFileBuffer::new(buffer, &saved))
+    });
+    let SavedFileBuffer {
+        contents,
+        mtime,
+        deleted_file,
+        text_format,
+    } = saved;
+    match plan {
+        FileBufferRestoration::UseLive => {}
+        FileBufferRestoration::Recover => {
+            let language = buffer.read_with(cx, |buffer, _| buffer.language().cloned());
+            let recovered = recovered_buffer(
+                project,
+                abs_path,
+                language,
+                contents.unwrap_or_default(),
+                text_format,
+                cx,
+            )
+            .await?;
+            return Ok((recovered, Some(abs_path.to_path_buf())));
+        }
+        FileBufferRestoration::Overwrite => {
+            buffer.update(cx, |buffer, cx| {
+                restore_serialized_buffer_contents(
+                    buffer,
+                    contents.unwrap_or_default(),
+                    mtime,
+                    text_format,
+                    cx,
+                );
+                if !buffer.is_dirty() {
+                    buffer.set_conflict();
+                }
+            });
+        }
+        FileBufferRestoration::RestoreDeleted => {
+            project.update(cx, |project, cx| {
+                project.buffer_store().update(cx, |buffer_store, cx| {
+                    buffer_store.mark_file_deleted(&buffer, cx)
+                })
+            });
+            buffer.update(cx, |buffer, cx| {
+                restore_serialized_buffer_contents(
+                    buffer,
+                    contents.unwrap_or_default(),
+                    mtime,
+                    text_format,
+                    cx,
+                );
+                let Some(deleted_file) = deleted_file else {
+                    return;
+                };
+                if !deleted_file.dirty {
+                    buffer.did_reload(buffer.version(), buffer.line_ending(), mtime, cx);
+                }
+                if deleted_file.read_only && buffer.capability() == Capability::ReadWrite {
+                    buffer.set_capability(Capability::Read, cx);
+                }
+            });
+        }
+        FileBufferRestoration::Redecode => {
+            if let Some(text_format) = text_format {
+                let reload = buffer.update(cx, |buffer, cx| {
+                    buffer.reload_with_encoding(text_format.encoding, cx)
+                });
+                if reload.await.is_err() {
+                    log::warn!(
+                        "Failed to reload {abs_path:?} with its saved encoding {}",
+                        text_format.encoding.name()
+                    );
+                }
+            }
+        }
+    }
+    Ok((buffer, None))
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RestoredBufferKey {
+    Recovery {
+        project: EntityId,
+        abs_path: PathBuf,
+        contents: String,
+        text_format: Option<TextFormat>,
+    },
+    Shared {
+        project: EntityId,
+        workspace_id: workspace::WorkspaceId,
+        buffer: String,
+        contents: Option<String>,
+        text_format: Option<TextFormat>,
+    },
+}
+
+impl RestoredBufferKey {
+    fn reusable(&self, buffer: &Buffer) -> bool {
+        match self {
+            Self::Recovery {
+                contents,
+                text_format,
+                ..
+            } => buffer.file().is_none() && holds_snapshot(buffer, contents, text_format.as_ref()),
+            Self::Shared { .. } => true,
+        }
+    }
+}
+
+fn holds_snapshot(buffer: &Buffer, contents: &str, text_format: Option<&TextFormat>) -> bool {
+    buffer.text() == contents
+        && text_format.is_none_or(|text_format| TextFormat::of(buffer) == *text_format)
+}
+
+#[derive(Default)]
+struct RestoredBuffers(HashMap<RestoredBufferKey, RestoredBuffer>);
+
+impl Global for RestoredBuffers {}
+
+#[derive(Clone)]
+enum RestoredBuffer {
+    Pending(Shared<Task<Result<Entity<Buffer>, Arc<anyhow::Error>>>>),
+    Ready(WeakEntity<Buffer>),
+}
+
+async fn saved_language(
+    project: &Entity<Project>,
+    language_name: Option<String>,
+    cx: &mut AsyncWindowContext,
+) -> Option<Arc<Language>> {
+    let language_name = language_name?;
+    let language_registry = project.read_with(cx, |project, _| project.languages().clone());
+    // We don't fail here, because we'd rather not set the language if the name changed
+    // than fail to restore the buffer.
+    language_registry
+        .language_for_name(&language_name)
+        .await
+        .ok()
+}
+
+async fn recovered_buffer(
+    project: &Entity<Project>,
+    abs_path: &Path,
+    language: Option<Arc<Language>>,
+    contents: String,
+    text_format: Option<TextFormat>,
+    cx: &mut AsyncWindowContext,
+) -> Result<Entity<Buffer>> {
+    let key = RestoredBufferKey::Recovery {
+        project: project.entity_id(),
+        abs_path: abs_path.to_path_buf(),
+        contents: contents.clone(),
+        text_format,
+    };
+    let detect_language = language.is_none();
+    restored_buffer(
+        project,
+        Some(key),
+        language,
+        detect_language,
+        Some(contents),
+        text_format,
+        cx,
+    )
+    .await
+    .context("Failed to create a buffer for the restored contents")
+}
+
+async fn restored_buffer(
+    project: &Entity<Project>,
+    key: Option<RestoredBufferKey>,
+    language: Option<Arc<Language>>,
+    detect_language: bool,
+    contents: Option<String>,
+    text_format: Option<TextFormat>,
+    cx: &mut AsyncWindowContext,
+) -> Result<Entity<Buffer>> {
+    let create = |cx: &mut App| {
+        new_buffer(
+            project,
+            language,
+            detect_language,
+            contents,
+            text_format,
+            cx,
+        )
+    };
+    let Some(key) = key else {
+        return cx.update(|_, cx| create(cx))?.await;
+    };
+    let earlier = cx.update(|_, cx| cx.try_global::<RestoredBuffers>()?.0.get(&key).cloned())?;
+    let earlier = match earlier {
+        Some(RestoredBuffer::Ready(buffer)) => buffer.upgrade(),
+        Some(RestoredBuffer::Pending(restoration)) => restoration.await.ok(),
+        None => None,
+    };
+    if let Some(earlier) = earlier
+        && earlier.read_with(cx, |buffer, _| key.reusable(buffer))
+    {
+        return Ok(earlier);
+    }
+
+    let restoration = cx.update(|_, cx| {
+        let create = create(cx);
+        let restoration = cx
+            .spawn({
+                let key = key.clone();
+                async move |cx| {
+                    let restored = create.await.map_err(Arc::new);
+                    cx.update(|cx| finish_buffer_restoration(key, &restored, cx));
+                    restored
+                }
+            })
+            .shared();
+        cx.default_global::<RestoredBuffers>()
+            .0
+            .insert(key, RestoredBuffer::Pending(restoration.clone()));
+        restoration
+    })?;
+    restoration.await.map_err(|error| anyhow!("{error:#}"))
+}
+
+fn finish_buffer_restoration(
+    key: RestoredBufferKey,
+    restored: &Result<Entity<Buffer>, Arc<anyhow::Error>>,
+    cx: &mut App,
+) {
+    let restored_buffers = &mut cx.default_global::<RestoredBuffers>().0;
+    let Ok(buffer) = restored else {
+        restored_buffers.remove(&key);
+        return;
+    };
+    restored_buffers.insert(key.clone(), RestoredBuffer::Ready(buffer.downgrade()));
+    let buffer_id = buffer.entity_id();
+    cx.observe_release(buffer, move |_, cx| {
+        let restored_buffers = &mut cx.default_global::<RestoredBuffers>().0;
+        if let Some(RestoredBuffer::Ready(released)) = restored_buffers.get(&key)
+            && released.entity_id() == buffer_id
+        {
+            restored_buffers.remove(&key);
+        }
+    })
+    .detach();
+}
+
+fn restoration_failure(abs_path: &Path) -> RestorationFailure {
+    RestorationFailure {
+        label: SharedString::from(
+            abs_path
+                .file_name()
+                .unwrap_or(abs_path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        tooltip: Some(SharedString::from(abs_path.to_string_lossy().into_owned())),
+    }
+}
+
+fn new_buffer(
+    project: &Entity<Project>,
+    language: Option<Arc<Language>>,
+    detect_language: bool,
+    contents: Option<String>,
+    text_format: Option<TextFormat>,
+    cx: &mut App,
+) -> Task<Result<Entity<Buffer>>> {
+    let language_registry = project.read(cx).languages().clone();
+    let create_buffer = project.update(cx, |project, cx| project.create_buffer(language, true, cx));
+    cx.spawn(async move |cx| {
+        let buffer = create_buffer.await?;
+        buffer.update(cx, |buffer, cx| {
+            if detect_language {
+                buffer.set_content_language_detection_enabled(true);
+            }
+            // Then set the text so that the dirty bit is set correctly
+            if let Some(contents) = contents {
+                buffer.set_language_registry(language_registry);
+                restore_serialized_buffer_contents(buffer, contents, None, text_format, cx);
+            }
+        });
+        Ok(buffer)
+    })
+}
+
 /// Restores serialized buffer contents by overwriting the buffer with saved text.
 /// This is somewhat wasteful since we load the whole buffer from disk then overwrite it,
 /// but keeps implementation simple as we don't need to persist all metadata from loading
 /// (git diff base, etc.).
-async fn restore_buffer_contents(
-    project: &Entity<Project>,
-    buffer: Entity<Buffer>,
-    abs_path: &Path,
-    contents: Option<String>,
-    mtime: Option<MTime>,
-    cx: &mut AsyncWindowContext,
-) -> Result<(Entity<Buffer>, Option<PathBuf>)> {
-    let Some(contents) = contents else {
-        return Ok((buffer, None));
-    };
-    let earlier_restoration = cx.update(|_, cx| {
-        match cx
-            .try_global::<RestoredBuffers>()?
-            .0
-            .get(&buffer.entity_id())?
-        {
-            RestoredBuffer::Source => Some((buffer.clone(), None)),
-            RestoredBuffer::RecoveredCopy(restored_copy) => {
-                Some((restored_copy.upgrade()?, Some(abs_path.to_path_buf())))
-            }
-        }
-    })?;
-    if let Some(earlier_restoration) = earlier_restoration {
-        return Ok(earlier_restoration);
-    }
-    let (has_unsaved_edits, already_restored) = buffer.read_with(cx, |buffer, _| {
-        (buffer.has_unsaved_edits(), buffer.text() == contents)
-    });
-    if !has_unsaved_edits || already_restored || contents.is_empty() {
-        if !has_unsaved_edits {
-            buffer.update(cx, |buffer, cx| {
-                restore_serialized_buffer_contents(buffer, contents, mtime, cx);
-            });
-        }
-        cx.update(|_, cx| remember_restored_buffer(&buffer, RestoredBuffer::Source, cx))?;
-        return Ok((buffer, None));
-    }
-    let language = buffer.read_with(cx, |buffer, _| buffer.language().cloned());
-    let restored_copy = project
-        .update(cx, |project, cx| project.create_buffer(language, true, cx))
-        .await
-        .context("Failed to create a buffer for the restored contents")?;
-    restored_copy.update(cx, |restored_copy, cx| {
-        restored_copy.set_text(contents, cx);
-        if let Some(entry) = restored_copy.peek_undo_stack() {
-            restored_copy.forget_transaction(entry.transaction_id());
-        }
-    });
-    cx.update(|_, cx| {
-        remember_restored_buffer(
-            &buffer,
-            RestoredBuffer::RecoveredCopy(restored_copy.downgrade()),
-            cx,
-        )
-    })?;
-    Ok((restored_copy, Some(abs_path.to_path_buf())))
-}
-
-#[derive(Default)]
-struct RestoredBuffers(HashMap<EntityId, RestoredBuffer>);
-
-impl Global for RestoredBuffers {}
-
-enum RestoredBuffer {
-    Source,
-    RecoveredCopy(WeakEntity<Buffer>),
-}
-
-fn remember_restored_buffer(buffer: &Entity<Buffer>, restored: RestoredBuffer, cx: &mut App) {
-    let buffer_id = buffer.entity_id();
-    let first_restoration = cx
-        .default_global::<RestoredBuffers>()
-        .0
-        .insert(buffer_id, restored)
-        .is_none();
-    if first_restoration {
-        cx.observe_release(buffer, move |_, cx| {
-            cx.default_global::<RestoredBuffers>().0.remove(&buffer_id);
-        })
-        .detach();
-    }
-}
-
 fn restore_serialized_buffer_contents(
     buffer: &mut Buffer,
     contents: String,
     mtime: Option<MTime>,
+    text_format: Option<TextFormat>,
     cx: &mut Context<Buffer>,
 ) {
     // If we did restore an mtime, store it on the buffer so that
@@ -2460,6 +2732,11 @@ fn restore_serialized_buffer_contents(
     buffer.set_text(contents, cx);
     if let Some(entry) = buffer.peek_undo_stack() {
         buffer.forget_transaction(entry.transaction_id());
+    }
+    if let Some(text_format) = text_format {
+        buffer.set_line_ending(text_format.line_ending, cx);
+        buffer.set_encoding(text_format.encoding);
+        buffer.set_has_bom(text_format.has_bom);
     }
 }
 
@@ -2699,10 +2976,12 @@ mod tests {
     use super::*;
     use fs::MTime;
     use gpui::{App, VisualTestContext};
-    use language::TestFile;
+    use language::{LanguageName, TestFile};
     use project::FakeFs;
     use serde_json::json;
+    use settings::{SettingsStore, SplicingVec};
     use std::path::{Path, PathBuf};
+    use text::{LineEnding, ReplicaId};
     use util::{
         path,
         paths::PathWithPosition,
@@ -2946,6 +3225,7 @@ mod tests {
     #[gpui::test]
     async fn test_deserialize(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_file(path!("/file.rs"), Default::default()).await;
@@ -2973,7 +3253,7 @@ mod tests {
                 contents: Some("fn main() {}".to_string()),
                 language: Some("Rust".to_string()),
                 mtime: Some(mtime),
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3011,7 +3291,7 @@ mod tests {
                 contents: None,
                 language: None,
                 mtime: None,
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3055,7 +3335,7 @@ mod tests {
                 contents: Some("hello".to_string()),
                 language: Some("Rust".to_string()),
                 mtime: None,
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3099,7 +3379,7 @@ mod tests {
                 contents: Some("fn main() {}".to_string()),
                 language: Some("Rust".to_string()),
                 mtime: Some(old_mtime),
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3134,7 +3414,7 @@ mod tests {
                 contents: None,
                 language: None,
                 mtime: None,
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3189,7 +3469,7 @@ mod tests {
                 contents: Some("modified content".to_string()),
                 language: Some("Rust".to_string()),
                 mtime: Some(mtime),
-                recovered_from: None,
+                ..SerializedEditor::default()
             };
 
             editor_db
@@ -3294,6 +3574,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx, |_| {});
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(path!("/outside"), json!({ "settings.json": "{}" }))
@@ -3315,7 +3596,7 @@ mod tests {
             contents: None,
             language: None,
             mtime: None,
-            recovered_from: None,
+            ..SerializedEditor::default()
         };
 
         editor_db
@@ -3359,339 +3640,783 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_deserialize_keeps_edits_made_before_restoration(cx: &mut gpui::TestAppContext) {
+    async fn test_restoring_unsaved_contents_of_open_files(cx: &mut gpui::TestAppContext) {
         init_test(cx, |_| {});
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
 
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(
             path!("/root"),
-            json!({ "edited.txt": "disk", "split.txt": "disk", "cleared.txt": "disk" }),
+            json!({ "edited.txt": "disk", "split.txt": "disk", "emptied.txt": "disk" }),
         )
         .await;
         let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let workspace_id = cx
-            .update(|_, cx| workspace::WorkspaceDb::global(cx))
-            .next_id()
+        let edited_buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/root/edited.txt"), cx)
+            })
             .await
             .unwrap();
-        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
-        for (item_id, file_name, contents) in [
-            (1, "edited.txt", "saved"),
-            (2, "split.txt", "saved"),
-            (3, "split.txt", "saved"),
-            (5, "edited.txt", "saved"),
-            (6, "cleared.txt", ""),
-        ] {
-            editor_db
-                .save_serialized_editor(
-                    item_id,
-                    workspace_id,
-                    SerializedEditor {
-                        abs_path: Some(PathBuf::from(path!("/root")).join(file_name)),
-                        contents: Some(contents.to_string()),
-                        language: None,
-                        mtime: None,
-                        recovered_from: None,
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        editor_db
-            .save_serialized_editor(
-                4,
-                workspace_id,
-                SerializedEditor {
-                    abs_path: None,
-                    contents: Some("recovered earlier".to_string()),
-                    language: None,
-                    mtime: None,
-                    recovered_from: Some(PathBuf::from(path!("/root/edited.txt"))),
-                },
-            )
-            .await
-            .unwrap();
-        let mut live_buffers = Vec::new();
-        for path in [path!("/root/edited.txt"), path!("/root/cleared.txt")] {
-            let live_buffer = project
-                .update(cx, |project, cx| project.open_local_buffer(path, cx))
-                .await
-                .unwrap();
-            live_buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "live ")], None, cx));
-            live_buffers.push(live_buffer);
-        }
-
-        let mut restored = Vec::new();
-        let mut editors = Vec::new();
-        for item_id in [1, 2, 3, 4, 5, 6] {
-            let editor = deserialize_editor(
-                item_id,
-                workspace_id,
-                workspace.clone(),
-                project.clone(),
-                cx,
-            )
-            .await;
-            editors.push(editor.clone());
-            restored.push(editor.update(cx, |editor, cx| {
-                let buffer = editor.buffer().read(cx).as_singleton().unwrap();
-                (
-                    editor.text(cx),
-                    buffer.read(cx).file().map(|file| file.path().clone()),
-                    editor.tab_content_text(0, cx).to_string(),
-                    editor.recovered_from.clone(),
-                    buffer.entity_id(),
-                )
-            }));
-        }
-
-        let recovered_from = Some(PathBuf::from(path!("/root/edited.txt")));
-        assert_eq!(
-            (
-                live_buffers
-                    .iter()
-                    .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.text()))
-                    .collect::<Vec<_>>(),
-                restored
-                    .iter()
-                    .map(|(text, path, tab, recovered_from, _)| (
-                        text.clone(),
-                        path.clone(),
-                        tab.clone(),
-                        recovered_from.clone()
-                    ))
-                    .collect::<Vec<_>>(),
-                restored[1].4 == restored[2].4,
-                restored[0].4 == restored[4].4,
-                restored[5].4 == live_buffers[1].entity_id(),
-            ),
-            (
-                vec!["live disk".to_string(), "live disk".to_string()],
-                vec![
-                    (
-                        "saved".to_string(),
-                        None,
-                        "edited.txt (recovered)".to_string(),
-                        recovered_from.clone()
-                    ),
-                    (
-                        "saved".to_string(),
-                        Some(rel_path("split.txt").into()),
-                        "split.txt".to_string(),
-                        None
-                    ),
-                    (
-                        "saved".to_string(),
-                        Some(rel_path("split.txt").into()),
-                        "split.txt".to_string(),
-                        None
-                    ),
-                    (
-                        "recovered earlier".to_string(),
-                        None,
-                        "edited.txt (recovered)".to_string(),
-                        recovered_from.clone()
-                    ),
-                    (
-                        "saved".to_string(),
-                        None,
-                        "edited.txt (recovered)".to_string(),
-                        recovered_from
-                    ),
-                    (
-                        "live disk".to_string(),
-                        Some(rel_path("cleared.txt").into()),
-                        "cleared.txt".to_string(),
-                        None
-                    ),
-                ],
-                true,
-                true,
-                true,
-            )
-        );
-    }
-
-    #[gpui::test]
-    async fn test_restoring_emptied_file_into_splits_keeps_it_dirty(cx: &mut gpui::TestAppContext) {
-        init_test(cx, |_| {});
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
-
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/root"), json!({ "emptied.txt": "disk" }))
-            .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let workspace_id = cx
-            .update(|_, cx| workspace::WorkspaceDb::global(cx))
-            .next_id()
-            .await
-            .unwrap();
-        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+        edited_buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "live ")], None, cx));
         let mtime = fs
             .metadata(Path::new(path!("/root/emptied.txt")))
             .await
             .unwrap()
             .unwrap()
             .mtime;
-        for item_id in [1, 2] {
-            editor_db
-                .save_serialized_editor(
-                    item_id,
-                    workspace_id,
-                    SerializedEditor {
-                        abs_path: Some(PathBuf::from(path!("/root/emptied.txt"))),
-                        contents: Some(String::new()),
-                        language: None,
-                        mtime: Some(mtime),
-                        recovered_from: None,
-                    },
-                )
-                .await
-                .unwrap();
-        }
 
-        let mut restored = Vec::new();
-        for item_id in [1, 2] {
-            let editor = deserialize_editor(
-                item_id,
-                workspace_id,
-                workspace.clone(),
-                project.clone(),
-                cx,
-            )
-            .await;
-            restored.push(editor.update(cx, |editor, cx| {
-                (
-                    editor.text(cx),
-                    editor.is_dirty(cx),
-                    editor.recovered_from.clone(),
-                )
-            }));
-        }
+        let serialized_editors = [
+            ("edited.txt", "saved", None),
+            ("edited.txt", "saved", None),
+            ("edited.txt", "", None),
+            ("split.txt", "older", None),
+            ("split.txt", "older", None),
+            ("split.txt", "newer", None),
+            ("emptied.txt", "", Some(mtime)),
+            ("emptied.txt", "", Some(mtime)),
+        ]
+        .into_iter()
+        .map(|(file_name, contents, mtime)| SerializedEditor {
+            abs_path: Some(PathBuf::from(path!("/root")).join(file_name)),
+            contents: Some(contents.to_string()),
+            mtime,
+            ..SerializedEditor::default()
+        })
+        .collect();
+        let (editors, cx) = restore_editors(&project, serialized_editors, false, cx).await;
 
         assert_eq!(
-            restored,
-            vec![(String::new(), true, None), (String::new(), true, None)]
+            (
+                edited_buffer.read_with(cx, |buffer, _| buffer.text()),
+                restored_states(&editors, cx),
+            ),
+            (
+                "live disk".to_string(),
+                vec![
+                    (
+                        "saved".to_string(),
+                        "edited.txt (recovered)".to_string(),
+                        true,
+                        0
+                    ),
+                    (
+                        "saved".to_string(),
+                        "edited.txt (recovered)".to_string(),
+                        true,
+                        0
+                    ),
+                    (String::new(), "edited.txt (recovered)".to_string(), true, 1),
+                    ("older".to_string(), "split.txt".to_string(), true, 2),
+                    ("older".to_string(), "split.txt".to_string(), true, 2),
+                    (
+                        "newer".to_string(),
+                        "split.txt (recovered)".to_string(),
+                        true,
+                        3
+                    ),
+                    (String::new(), "emptied.txt".to_string(), true, 4),
+                    (String::new(), "emptied.txt".to_string(), true, 4),
+                ],
+            )
         );
     }
 
     #[gpui::test]
-    async fn test_restoring_diverged_views_of_a_file_shares_one_buffer(
+    async fn test_unopenable_file_restores_its_unsaved_contents_as_recovered(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx, |_| {});
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(path!("/root"), json!({ "split.txt": "disk" }))
+        fs.insert_tree(path!("/root"), json!({ "notes.txt": {} }))
             .await;
-        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let workspace_id = cx
-            .update(|_, cx| workspace::WorkspaceDb::global(cx))
-            .next_id()
-            .await
-            .unwrap();
-        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
-        for (item_id, contents) in [(1, "older"), (2, ""), (3, "newer"), (4, "newer")] {
-            editor_db
-                .save_serialized_editor(
-                    item_id,
-                    workspace_id,
-                    SerializedEditor {
-                        abs_path: Some(PathBuf::from(path!("/root/split.txt"))),
-                        contents: Some(contents.to_string()),
-                        language: None,
-                        mtime: None,
-                        recovered_from: None,
-                    },
-                )
-                .await
-                .unwrap();
-        }
+        let project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        project.read_with(cx, |project, _| {
+            project.languages().add(languages::rust_lang())
+        });
 
-        let mut restored = Vec::new();
-        let mut editors = Vec::new();
-        for item_id in [1, 2, 3, 4] {
-            let editor = deserialize_editor(
-                item_id,
-                workspace_id,
-                workspace.clone(),
-                project.clone(),
-                cx,
-            )
-            .await;
-            editors.push(editor.clone());
-            restored.push(editor.update(cx, |editor, cx| {
-                (
-                    editor.text(cx),
-                    editor.is_dirty(cx),
-                    editor.recovered_from.clone(),
-                    editor.buffer().read(cx).as_singleton().unwrap().entity_id(),
-                )
-            }));
-        }
+        let serialized_editors = ["unsaved", "unsaved", "diverged"]
+            .into_iter()
+            .map(|contents| SerializedEditor {
+                abs_path: Some(PathBuf::from(path!("/root/notes.txt"))),
+                contents: Some(contents.to_string()),
+                language: Some("Rust".to_string()),
+                ..SerializedEditor::default()
+            })
+            .collect();
+        let (editors, cx) = restore_editors(&project, serialized_editors, true, cx).await;
 
-        let source_buffer = restored[0].3;
         assert_eq!(
-            restored,
-            vec![("older".to_string(), true, None, source_buffer); 4]
+            (
+                restored_states(&editors, cx),
+                editors[0].read_with(cx, |editor, cx| {
+                    editor.buffer().read(cx).as_singleton().and_then(|buffer| {
+                        buffer.read(cx).language().map(|language| language.name())
+                    })
+                }),
+            ),
+            (
+                vec![
+                    (
+                        "unsaved".to_string(),
+                        "notes.txt (recovered)".to_string(),
+                        true,
+                        0
+                    ),
+                    (
+                        "unsaved".to_string(),
+                        "notes.txt (recovered)".to_string(),
+                        true,
+                        0
+                    ),
+                    (
+                        "diverged".to_string(),
+                        "notes.txt (recovered)".to_string(),
+                        true,
+                        1
+                    ),
+                ],
+                Some(LanguageName::new_static("Rust")),
+            )
         );
     }
 
     #[gpui::test]
-    async fn test_recovered_scratch_without_contents_keeps_its_source(
+    async fn test_restoring_unsaved_buffers_without_files(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let recovered_from = PathBuf::from(path!("/root/edited.txt"));
+        let serialized_editors = [
+            (Some("session/7"), Some("unsaved"), None),
+            (Some("session/7"), Some("unsaved"), None),
+            (Some("session/8"), Some("unsaved"), None),
+            (Some("session/7"), Some("stale"), None),
+            (Some("session/9"), Some("recovered"), Some(&recovered_from)),
+            (Some("session/9"), Some("recovered"), Some(&recovered_from)),
+            (None, None, Some(&recovered_from)),
+        ]
+        .into_iter()
+        .map(
+            |(shared_buffer, contents, recovered_from)| SerializedEditor {
+                contents: contents.map(str::to_string),
+                recovered_from: recovered_from.cloned(),
+                shared_buffer: shared_buffer.map(str::to_string),
+                ..SerializedEditor::default()
+            },
+        )
+        .collect();
+        let (editors, cx) = restore_editors(&project, serialized_editors, false, cx).await;
+
+        assert_eq!(
+            (
+                restored_states(&editors, cx),
+                editors[6].read_with(cx, |editor, cx| editor.suggested_filename(cx)),
+            ),
+            (
+                vec![
+                    ("unsaved".to_string(), "unsaved".to_string(), true, 0),
+                    ("unsaved".to_string(), "unsaved".to_string(), true, 0),
+                    ("unsaved".to_string(), "unsaved".to_string(), true, 1),
+                    ("stale".to_string(), "stale".to_string(), true, 2),
+                    (
+                        "recovered".to_string(),
+                        "edited.txt (recovered)".to_string(),
+                        true,
+                        3
+                    ),
+                    (
+                        "recovered".to_string(),
+                        "edited.txt (recovered)".to_string(),
+                        true,
+                        3
+                    ),
+                    (String::new(), "edited.txt (recovered)".to_string(), true, 4),
+                ],
+                SharedString::from("edited.txt"),
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_fileless_buffers_with_equal_remote_ids_restore_separately(
         cx: &mut gpui::TestAppContext,
     ) {
         init_test(cx, |_| {});
-        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
 
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
-        let (multi_workspace, cx) =
-            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
-        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
-        let workspace_id = cx
-            .update(|_, cx| workspace::WorkspaceDb::global(cx))
-            .next_id()
-            .await
-            .unwrap();
-        cx.update(|_, cx| EditorDb::global(cx))
-            .save_serialized_editor(
-                1,
-                workspace_id,
-                SerializedEditor {
-                    abs_path: None,
-                    contents: None,
-                    language: None,
-                    mtime: None,
-                    recovered_from: Some(PathBuf::from(path!("/root/edited.txt"))),
-                },
-            )
-            .await
-            .unwrap();
-
-        let editor = deserialize_editor(1, workspace_id, workspace, project, cx).await;
-
-        let labels = editor.update(cx, |editor, cx| {
-            (
-                tab_title(editor, cx).to_string(),
-                editor.suggested_filename(cx).to_string(),
-            )
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let buffers = [0, 1].map(|_| {
+            cx.new(|cx| {
+                let mut buffer = Buffer::remote(
+                    BufferId::new(7).unwrap(),
+                    ReplicaId::LOCAL,
+                    Capability::ReadWrite,
+                    "",
+                    cx,
+                );
+                buffer.edit([(0..0, "same")], None, cx);
+                buffer
+            })
         });
+        let editors = [&buffers[0], &buffers[0], &buffers[1]].map(|buffer| {
+            cx.new_window_entity(|window, cx| {
+                Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+            })
+        });
+        serialize_editors(&workspace, &editors, cx).await;
+
+        let restored_project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let restored = restore_serialized_editors(&workspace, &restored_project, 3, cx).await;
+
         assert_eq!(
-            labels,
+            restored_states(&restored, cx),
+            vec![
+                ("same".to_string(), "same".to_string(), true, 0),
+                ("same".to_string(), "same".to_string(), true, 0),
+                ("same".to_string(), "same".to_string(), true, 1),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_deleted_files_restore_like_live_buffers(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "clean.txt": "clean text",
+                "dirty.txt": "saved text",
+                "locked.txt": "locked text",
+                "empty.txt": "",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let file_names = [
+            "clean.txt",
+            "clean.txt",
+            "dirty.txt",
+            "locked.txt",
+            "empty.txt",
+        ];
+        let live_buffers = open_root_buffers(&project, &file_names, cx).await;
+        live_buffers[2].update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        live_buffers[3].update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        remove_root_files(&fs, &file_names[1..], cx).await;
+        let editors = editors_for_buffers(&project, &live_buffers, cx);
+        serialize_editors(&workspace, &editors, cx).await;
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.file_scan_exclusions =
+                        Some(SplicingVec::from(Vec::from([String::from("**/dirty.txt")])));
+                });
+            });
+        });
+
+        let restored_project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let restored = restore_serialized_editors(&workspace, &restored_project, 5, cx).await;
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let saved_mtimes = [&live_buffers, &restored_buffers].map(|buffers| {
+            buffers
+                .iter()
+                .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.saved_mtime()))
+                .collect::<Vec<_>>()
+        });
+        let states = [&live_buffers, &restored_buffers].map(|buffers| buffer_states(buffers, cx));
+        restored_project
+            .update(cx, |project, cx| {
+                project.save_buffer(restored_buffers[2].clone(), cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+        let saved_text = fs.load(Path::new(path!("/root/dirty.txt"))).await.unwrap();
+        let saved_state = buffer_states(&restored_buffers[2..3], cx);
+
+        let expected_states = vec![
+            buffer_state("clean text", false, false, "deleted", Capability::ReadWrite),
+            buffer_state("clean text", false, false, "deleted", Capability::ReadWrite),
+            buffer_state(
+                "unsaved saved text",
+                true,
+                false,
+                "deleted",
+                Capability::ReadWrite,
+            ),
+            buffer_state("locked text", false, false, "deleted", Capability::Read),
+            buffer_state("", false, false, "deleted", Capability::ReadWrite),
+        ];
+        assert_eq!(
             (
-                "edited.txt (recovered)".to_string(),
-                "edited.txt".to_string()
+                states,
+                saved_mtimes[1] == saved_mtimes[0],
+                restored_buffers[0] == restored_buffers[1],
+                saved_text,
+                saved_state,
+            ),
+            (
+                [expected_states.clone(), expected_states],
+                true,
+                true,
+                "unsaved saved text".to_string(),
+                vec![buffer_state(
+                    "unsaved saved text",
+                    false,
+                    false,
+                    "present",
+                    Capability::ReadWrite,
+                )],
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_files_changed_while_closed_restore_like_live_buffers(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({
+                "clean.txt": "clean text",
+                "dirty.txt": "saved text",
+                "same.txt": "saved text",
+                "emptied.txt": "saved text",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let file_names = ["clean.txt", "dirty.txt", "same.txt", "emptied.txt"];
+        let live_buffers = open_root_buffers(&project, &file_names, cx).await;
+        for buffer in &live_buffers[1..3] {
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        }
+        live_buffers[3].update(cx, |buffer, cx| buffer.set_text("", cx));
+        remove_root_files(&fs, &file_names[..3], cx).await;
+        let editors = editors_for_buffers(&project, &live_buffers, cx);
+        serialize_editors(&workspace, &editors, cx).await;
+        for (file_name, text) in [
+            ("clean.txt", "reappeared"),
+            ("dirty.txt", "reappeared"),
+            ("same.txt", "unsaved saved text"),
+            ("emptied.txt", ""),
+        ] {
+            fs.insert_file(
+                PathBuf::from(path!("/root")).join(file_name),
+                text.as_bytes().to_vec(),
+            )
+            .await;
+        }
+        cx.run_until_parked();
+
+        let restored_project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let restored = restore_serialized_editors(&workspace, &restored_project, 4, cx).await;
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let states = [&live_buffers, &restored_buffers].map(|buffers| buffer_states(buffers, cx));
+
+        let expected_states = vec![
+            buffer_state("reappeared", false, false, "present", Capability::ReadWrite),
+            buffer_state(
+                "unsaved saved text",
+                true,
+                true,
+                "present",
+                Capability::ReadWrite,
+            ),
+            buffer_state(
+                "unsaved saved text",
+                true,
+                true,
+                "present",
+                Capability::ReadWrite,
+            ),
+            buffer_state("", true, true, "present", Capability::ReadWrite),
+        ];
+        assert_eq!(states, [expected_states.clone(), expected_states]);
+    }
+
+    #[gpui::test]
+    async fn test_restored_text_format_saves_like_live_buffers(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let utf16_bytes = [0xFF, 0xFE]
+            .into_iter()
+            .chain("saved\r\ntext".encode_utf16().flat_map(u16::to_le_bytes))
+            .collect::<Vec<_>>();
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "windows.txt": "saved\r\ntext" }))
+            .await;
+        fs.insert_file(path!("/root/utf16.txt"), utf16_bytes).await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let mut live_buffers = open_root_buffers(&project, &["utf16.txt", "windows.txt"], cx).await;
+        live_buffers.push(project.update(cx, |project, cx| {
+            project.create_local_buffer("", None, false, cx)
+        }));
+        for buffer in &live_buffers {
+            buffer.update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        }
+        live_buffers[1].update(cx, |buffer, cx| {
+            buffer.set_line_ending(LineEnding::Unix, cx)
+        });
+        live_buffers[2].update(cx, |buffer, cx| {
+            buffer.set_line_ending(LineEnding::Windows, cx);
+            buffer.set_encoding(encoding_rs::UTF_16BE);
+            buffer.set_has_bom(true);
+            buffer.edit([(buffer.len()..buffer.len(), "\nline")], None, cx);
+        });
+        remove_root_files(&fs, &["utf16.txt"], cx).await;
+        let editors = editors_for_buffers(&project, &live_buffers, cx);
+        serialize_editors(&workspace, &editors, cx).await;
+
+        let restored_project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let restored = restore_serialized_editors(&workspace, &restored_project, 3, cx).await;
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let formats = [&live_buffers, &restored_buffers].map(|buffers| {
+            buffers
+                .iter()
+                .map(|buffer| {
+                    buffer.read_with(cx, |buffer, _| {
+                        (
+                            buffer.line_ending(),
+                            buffer.encoding().name(),
+                            buffer.has_bom(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut saved_bytes = Vec::new();
+        for (project, buffers, untitled_name) in [
+            (&restored_project, &restored_buffers, "restored.txt"),
+            (&project, &live_buffers, "live.txt"),
+        ] {
+            saved_bytes.push(save_buffers(&fs, project, buffers, untitled_name, cx).await);
+        }
+
+        let utf16_text = "unsaved saved\r\ntext";
+        let untitled_text = "unsaved \r\nline";
+        let expected_bytes = vec![
+            [0xFF, 0xFE]
+                .into_iter()
+                .chain(utf16_text.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect::<Vec<_>>(),
+            b"unsaved saved\ntext".to_vec(),
+            [0xFE, 0xFF]
+                .into_iter()
+                .chain(untitled_text.encode_utf16().flat_map(u16::to_be_bytes))
+                .collect::<Vec<_>>(),
+        ];
+        assert_eq!(
+            (formats[1].clone(), saved_bytes),
+            (
+                formats[0].clone(),
+                vec![expected_bytes.clone(), expected_bytes]
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restoring_equal_text_saved_in_different_formats_keeps_each_format(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "file.txt": "saved" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let buffer = open_root_buffers(&project, &["file.txt"], cx)
+            .await
+            .remove(0);
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "unsaved ")], None, cx);
+            buffer.set_encoding(encoding_rs::WINDOWS_1252);
+        });
+        let editors = editors_for_buffers(&project, &[buffer.clone(), buffer.clone()], cx);
+        serialize_editors(&workspace, &editors, cx).await;
+        buffer.update(cx, |buffer, _| buffer.set_encoding(encoding_rs::UTF_8));
+        serialize_editors(&workspace, &editors[..1], cx).await;
+
+        let restored_project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let restored = restore_serialized_editors(&workspace, &restored_project, 2, cx).await;
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let restored_formats = restored_buffers
+            .iter()
+            .map(|buffer| {
+                buffer.read_with(cx, |buffer, _| (buffer.text(), buffer.encoding().name()))
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            (restored_buffers[0] == restored_buffers[1], restored_formats),
+            (
+                false,
+                vec![
+                    ("unsaved saved".to_string(), "UTF-8"),
+                    ("unsaved saved".to_string(), "windows-1252"),
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn test_restoration_rewrites_only_buffers_without_unsaved_edits() {
+        let mut plans = HashSet::default();
+        for deleted_file in [
+            None,
+            Some(DeletedFile {
+                dirty: false,
+                read_only: false,
+            }),
+            Some(DeletedFile {
+                dirty: true,
+                read_only: true,
+            }),
+        ] {
+            for contents in [None, Some(String::new()), Some(String::from("saved"))] {
+                for disk_state in [
+                    LiveDiskState::Present,
+                    LiveDiskState::New,
+                    LiveDiskState::Deleted,
+                ] {
+                    for (has_saved_snapshot, has_saved_encoding) in
+                        [(false, false), (false, true), (true, false), (true, true)]
+                    {
+                        let saved = SavedFileBuffer {
+                            contents: contents.clone(),
+                            mtime: None,
+                            deleted_file,
+                            text_format: None,
+                        };
+                        let live = LiveFileBuffer {
+                            disk_state,
+                            has_unsaved_edits: true,
+                            has_saved_snapshot,
+                            has_saved_encoding,
+                        };
+                        plans.insert((
+                            has_saved_snapshot,
+                            plan_file_buffer_restoration(&saved, live),
+                        ));
+                    }
+                }
+            }
+        }
+
+        assert_eq!(
+            plans,
+            HashSet::from_iter([
+                (false, FileBufferRestoration::UseLive),
+                (false, FileBufferRestoration::Recover),
+                (true, FileBufferRestoration::UseLive),
+            ])
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restoration_keeps_live_buffer_state_that_diverged_from_the_saved_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "locked.txt": "locked" }))
+            .await;
+        fs.insert_file(path!("/root/encoded.txt"), Vec::from([0xFF, 0xFE]))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let file_names = ["encoded.txt", "locked.txt"];
+        let live_buffers = open_root_buffers(&project, &file_names, cx).await;
+        let original_encoding = live_buffers[0].read_with(cx, |buffer, _| buffer.encoding().name());
+        remove_root_files(&fs, &file_names, cx).await;
+        let editors = editors_for_buffers(&project, &live_buffers, cx);
+        serialize_editors(&workspace, &editors, cx).await;
+        for file_name in file_names {
+            fs.insert_file(
+                PathBuf::from(path!("/root")).join(file_name),
+                b"recreated".to_vec(),
+            )
+            .await;
+        }
+        cx.update(|_, cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.project.worktree.read_only_files = Some(SplicingVec::from(Vec::from(
+                        [String::from("**/locked.txt")],
+                    )));
+                });
+            });
+        });
+        cx.run_until_parked();
+
+        let restored_project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let opened_before_restoration =
+            open_root_buffers(&restored_project, &["encoded.txt"], cx).await;
+        opened_before_restoration[0]
+            .update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        let restored = restore_serialized_editors(&workspace, &restored_project, 2, cx).await;
+        cx.run_until_parked();
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let encodings = restored_buffers
+            .iter()
+            .map(|buffer| buffer.read_with(cx, |buffer, _| buffer.encoding().name()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            (
+                original_encoding,
+                restored_buffers[0] == opened_before_restoration[0],
+                buffer_states(&restored_buffers, cx),
+                encodings,
+            ),
+            (
+                "UTF-16LE",
+                true,
+                vec![
+                    buffer_state(
+                        "unsaved recreated",
+                        true,
+                        false,
+                        "present",
+                        Capability::ReadWrite
+                    ),
+                    buffer_state("recreated", false, false, "present", Capability::Read),
+                ],
+                vec!["UTF-8", "UTF-8"],
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_restored_deleted_file_notifies_guests_like_live_deletion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/root"), json!({ "deleted.txt": "text" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let live_guest = share_with_recording_guest(&project, cx);
+        let live_buffers = open_root_buffers(&project, &["deleted.txt"], cx).await;
+        remove_root_files(&fs, &["deleted.txt"], cx).await;
+        let editors = editors_for_buffers(&project, &live_buffers, cx);
+        serialize_editors(&workspace, &editors, cx).await;
+
+        let restored_project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let restored_guest = share_with_recording_guest(&restored_project, cx);
+        restore_serialized_editors(&workspace, &restored_project, 1, cx).await;
+
+        let updates = [live_guest, restored_guest].map(|guest| guest.buffer_file_updates());
+        assert_eq!(
+            updates,
+            [
+                vec![("deleted.txt".to_string(), true, None)],
+                vec![("deleted.txt".to_string(), true, None)],
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_files_of_deleted_roots_restore_like_live_buffers(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/root"),
+            json!({ "clean.txt": "clean text", "dirty.txt": "saved text" }),
+        )
+        .await;
+        fs.insert_file(path!("/single.txt"), b"single text".to_vec())
+            .await;
+        let project = Project::test(fs.clone(), [path!("/root").as_ref()], cx).await;
+        let single_project = Project::test(fs.clone(), [path!("/single.txt").as_ref()], cx).await;
+        let (workspace, cx) = workspace_with_database_id(&project, cx).await;
+        let live_guest = share_with_recording_guest(&project, cx);
+        let single_guest = share_with_recording_guest(&single_project, cx);
+        let mut live_buffers = open_root_buffers(&project, &["clean.txt", "dirty.txt"], cx).await;
+        live_buffers.push(
+            single_project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer(path!("/single.txt"), cx)
+                })
+                .await
+                .unwrap(),
+        );
+        live_buffers[1].update(cx, |buffer, cx| buffer.edit([(0..0, "unsaved ")], None, cx));
+        fs.remove_dir(
+            Path::new(path!("/root")),
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .unwrap();
+        fs.remove_file(
+            Path::new(path!("/single.txt")),
+            fs::RemoveOptions::default(),
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_secs(1));
+        cx.run_until_parked();
+        let mut editors = editors_for_buffers(&project, &live_buffers[..2], cx);
+        editors.extend(editors_for_buffers(&single_project, &live_buffers[2..], cx));
+        serialize_editors(&workspace, &editors, cx).await;
+
+        let restored_project = Project::test(fs, [path!("/root").as_ref()], cx).await;
+        let restored_guest = share_with_recording_guest(&restored_project, cx);
+        let restored = restore_serialized_editors(&workspace, &restored_project, 3, cx).await;
+        let restored_buffers = singleton_buffers(&restored, cx);
+        let states = [&live_buffers, &restored_buffers].map(|buffers| buffer_states(buffers, cx));
+        let mut live_updates = live_guest.buffer_file_updates();
+        live_updates.extend(single_guest.buffer_file_updates());
+        let updates = [live_updates, restored_guest.buffer_file_updates()].map(|mut updates| {
+            updates.sort_by(|left, right| left.0.cmp(&right.0));
+            updates
+        });
+
+        let expected_states = vec![
+            buffer_state("clean text", false, false, "deleted", Capability::ReadWrite),
+            buffer_state(
+                "unsaved saved text",
+                true,
+                false,
+                "deleted",
+                Capability::ReadWrite,
+            ),
+            buffer_state(
+                "single text",
+                false,
+                false,
+                "deleted",
+                Capability::ReadWrite,
+            ),
+        ];
+        let expected_updates = vec![
+            (String::new(), true, None),
+            ("clean.txt".to_string(), true, None),
+            ("dirty.txt".to_string(), true, None),
+        ];
+        assert_eq!(
+            (states, updates),
+            (
+                [expected_states.clone(), expected_states],
+                [expected_updates.clone(), expected_updates]
             )
         );
     }
@@ -3956,5 +4681,354 @@ mod tests {
             assert!(buffer.file().is_none());
             assert!(buffer.is_dirty());
         });
+    }
+
+    async fn restore_editors<'a>(
+        project: &Entity<Project>,
+        serialized_editors: Vec<SerializedEditor>,
+        concurrently: bool,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (Vec<Entity<Editor>>, &'a mut VisualTestContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let workspace_id = cx
+            .update(|_, cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let editor_db = cx.update(|_, cx| EditorDb::global(cx));
+        let item_ids = 1..=serialized_editors.len() as ItemId;
+        for (item_id, serialized_editor) in item_ids.clone().zip(serialized_editors) {
+            editor_db
+                .save_serialized_editor(item_id, workspace_id, serialized_editor)
+                .await
+                .unwrap();
+        }
+
+        let editors = if concurrently {
+            let restorations = cx.update(|window, cx| {
+                item_ids
+                    .map(|item_id| {
+                        Editor::deserialize(
+                            project.clone(),
+                            workspace.downgrade(),
+                            workspace_id,
+                            item_id,
+                            window,
+                            cx,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            });
+            try_join_all(restorations).await.unwrap()
+        } else {
+            let mut editors = Vec::new();
+            for item_id in item_ids {
+                editors.push(
+                    deserialize_editor(
+                        item_id,
+                        workspace_id,
+                        workspace.clone(),
+                        project.clone(),
+                        cx,
+                    )
+                    .await,
+                );
+            }
+            editors
+        };
+        (editors, cx)
+    }
+
+    async fn workspace_with_database_id<'a>(
+        project: &Entity<Project>,
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (Entity<Workspace>, &'a mut VisualTestContext) {
+        cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace_id = cx
+            .update(|_, cx| workspace::WorkspaceDb::global(cx))
+            .next_id()
+            .await
+            .unwrap();
+        let workspace = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            let app_state = multi_workspace.workspace().read(cx).app_state().clone();
+            cx.new(|cx| Workspace::new(Some(workspace_id), project.clone(), app_state, window, cx))
+        });
+        (workspace, cx)
+    }
+
+    async fn serialize_editors(
+        workspace: &Entity<Workspace>,
+        editors: &[Entity<Editor>],
+        cx: &mut VisualTestContext,
+    ) {
+        let serializations = workspace.update(cx, |workspace, cx| {
+            editors
+                .iter()
+                .zip(1..)
+                .map(|(editor, item_id)| {
+                    editor
+                        .update(cx, |editor, cx| {
+                            SerializableItem::serialize(editor, workspace, item_id, false, cx)
+                        })
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        try_join_all(serializations).await.unwrap();
+    }
+
+    async fn restore_serialized_editors(
+        workspace: &Entity<Workspace>,
+        project: &Entity<Project>,
+        count: ItemId,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Entity<Editor>> {
+        let workspace_id = workspace
+            .read_with(cx, |workspace, _| workspace.database_id())
+            .unwrap();
+        let mut editors = Vec::new();
+        for item_id in 1..=count {
+            editors.push(
+                deserialize_editor(
+                    item_id,
+                    workspace_id,
+                    workspace.clone(),
+                    project.clone(),
+                    cx,
+                )
+                .await,
+            );
+        }
+        editors
+    }
+
+    async fn open_root_buffers(
+        project: &Entity<Project>,
+        file_names: &[&str],
+        cx: &mut VisualTestContext,
+    ) -> Vec<Entity<Buffer>> {
+        let mut buffers = Vec::new();
+        for file_name in file_names {
+            let abs_path = PathBuf::from(path!("/root")).join(file_name);
+            buffers.push(
+                project
+                    .update(cx, |project, cx| project.open_local_buffer(abs_path, cx))
+                    .await
+                    .unwrap(),
+            );
+        }
+        buffers
+    }
+
+    async fn remove_root_files(fs: &FakeFs, file_names: &[&str], cx: &mut VisualTestContext) {
+        for file_name in file_names {
+            fs.remove_file(
+                &PathBuf::from(path!("/root")).join(file_name),
+                fs::RemoveOptions::default(),
+            )
+            .await
+            .unwrap();
+        }
+        cx.run_until_parked();
+    }
+
+    fn editors_for_buffers(
+        project: &Entity<Project>,
+        buffers: &[Entity<Buffer>],
+        cx: &mut VisualTestContext,
+    ) -> Vec<Entity<Editor>> {
+        buffers
+            .iter()
+            .map(|buffer| {
+                cx.new_window_entity(|window, cx| {
+                    Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx)
+                })
+            })
+            .collect()
+    }
+
+    fn singleton_buffers(
+        editors: &[Entity<Editor>],
+        cx: &mut VisualTestContext,
+    ) -> Vec<Entity<Buffer>> {
+        editors
+            .iter()
+            .map(|editor| {
+                editor.read_with(cx, |editor, cx| {
+                    editor.buffer().read(cx).as_singleton().unwrap()
+                })
+            })
+            .collect()
+    }
+
+    fn buffer_states(
+        buffers: &[Entity<Buffer>],
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, bool, bool, &'static str, Capability)> {
+        buffers
+            .iter()
+            .map(|buffer| {
+                buffer.read_with(cx, |buffer, _| {
+                    let disk_state = match buffer.file().map(|file| file.disk_state()) {
+                        Some(DiskState::Present { .. }) => "present",
+                        Some(DiskState::Deleted) => "deleted",
+                        Some(DiskState::New) => "new",
+                        Some(DiskState::Historic { .. }) => "historic",
+                        None => "none",
+                    };
+                    buffer_state(
+                        &buffer.text(),
+                        buffer.is_dirty(),
+                        buffer.has_conflict(),
+                        disk_state,
+                        buffer.capability(),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn buffer_state(
+        text: &str,
+        dirty: bool,
+        conflict: bool,
+        disk_state: &'static str,
+        capability: Capability,
+    ) -> (String, bool, bool, &'static str, Capability) {
+        (text.to_string(), dirty, conflict, disk_state, capability)
+    }
+
+    async fn save_buffers(
+        fs: &FakeFs,
+        project: &Entity<Project>,
+        buffers: &[Entity<Buffer>],
+        untitled_name: &'static str,
+        cx: &mut VisualTestContext,
+    ) -> Vec<Vec<u8>> {
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let mut saved_bytes = Vec::new();
+        for buffer in buffers {
+            let has_file = buffer.read_with(cx, |buffer, _| buffer.file().is_some());
+            let save = project.update(cx, |project, cx| {
+                if has_file {
+                    project.save_buffer(buffer.clone(), cx)
+                } else {
+                    let path = ProjectPath {
+                        worktree_id,
+                        path: rel_path(untitled_name).into_arc(),
+                    };
+                    project.save_buffer_as(buffer.clone(), path, cx)
+                }
+            });
+            save.await.unwrap();
+            cx.run_until_parked();
+            let abs_path = buffer.read_with(cx, |buffer, cx| {
+                File::from_dyn(buffer.file()).unwrap().abs_path(cx)
+            });
+            saved_bytes.push(fs.read_file_sync(abs_path).unwrap());
+        }
+        saved_bytes
+    }
+
+    fn share_with_recording_guest(
+        project: &Entity<Project>,
+        cx: &mut VisualTestContext,
+    ) -> Arc<RecordingGuest> {
+        let guest = Arc::new(RecordingGuest::default());
+        project.update(cx, |project, cx| {
+            project.buffer_store().update(cx, |buffer_store, cx| {
+                buffer_store.shared(1, rpc::AnyProtoClient::new(guest.clone()), cx)
+            })
+        });
+        guest
+    }
+
+    #[derive(Default)]
+    struct RecordingGuest {
+        sent: parking_lot::Mutex<Vec<proto::Envelope>>,
+        handler_set: parking_lot::Mutex<rpc::ProtoMessageHandlerSet>,
+    }
+
+    impl RecordingGuest {
+        fn buffer_file_updates(&self) -> Vec<(String, bool, Option<proto::Timestamp>)> {
+            self.sent
+                .lock()
+                .iter()
+                .filter_map(|envelope| match &envelope.payload {
+                    Some(proto::envelope::Payload::UpdateBufferFile(update)) => {
+                        let file = update.file.as_ref()?;
+                        Some((file.path.clone(), file.is_deleted, file.mtime))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    impl rpc::ProtoClient for RecordingGuest {
+        fn request(
+            &self,
+            _: proto::Envelope,
+            request_type: &'static str,
+        ) -> futures::future::BoxFuture<'static, Result<proto::Envelope>> {
+            Box::pin(async move { Err(anyhow!("unexpected {request_type} request")) })
+        }
+
+        fn send(&self, envelope: proto::Envelope, _: &'static str) -> Result<()> {
+            self.sent.lock().push(envelope);
+            Ok(())
+        }
+
+        fn send_response(&self, _: proto::Envelope, _: &'static str) -> Result<()> {
+            Ok(())
+        }
+
+        fn message_handler_set(&self) -> &parking_lot::Mutex<rpc::ProtoMessageHandlerSet> {
+            &self.handler_set
+        }
+
+        fn is_via_collab(&self) -> bool {
+            true
+        }
+
+        fn has_wsl_interop(&self) -> bool {
+            false
+        }
+    }
+
+    fn restored_states(
+        editors: &[Entity<Editor>],
+        cx: &mut VisualTestContext,
+    ) -> Vec<(String, String, bool, usize)> {
+        let mut buffer_ids = Vec::new();
+        editors
+            .iter()
+            .map(|editor| {
+                editor.update(cx, |editor, cx| {
+                    let buffer_id = editor.buffer().read(cx).as_singleton().unwrap().entity_id();
+                    let buffer_index = buffer_ids
+                        .iter()
+                        .position(|id| *id == buffer_id)
+                        .unwrap_or_else(|| {
+                            buffer_ids.push(buffer_id);
+                            buffer_ids.len() - 1
+                        });
+                    (
+                        editor.text(cx),
+                        editor.tab_content_text(0, cx).to_string(),
+                        editor.is_dirty(cx),
+                        buffer_index,
+                    )
+                })
+            })
+            .collect()
     }
 }

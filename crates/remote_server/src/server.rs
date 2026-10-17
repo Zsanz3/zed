@@ -56,7 +56,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{Arc, LazyLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 #[cfg(unix)]
 use std::{
@@ -88,6 +88,8 @@ pub enum Commands {
         reconnect: bool,
         #[arg(long)]
         identifier: String,
+        #[arg(long)]
+        owner: String,
     },
     Version,
     #[cfg(unix)]
@@ -114,8 +116,10 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         ),
         Commands::Proxy {
             identifier,
+            owner,
             reconnect,
-        } => execute_proxy(identifier, reconnect).context("running proxy on the remote server"),
+        } => execute_proxy(identifier, owner, reconnect)
+            .context("running proxy on the remote server"),
         #[cfg(unix)]
         Commands::Exec => execute_command(),
         Commands::Version => {
@@ -833,6 +837,12 @@ pub fn execute_run(
 
         cx.background_spawn(async move {
             cleanup_old_binaries_wsl();
+            cleanup_stale_setup_server_state(
+                paths::remote_server_state_dir(),
+                logs_dir(),
+                STALE_SETUP_SERVER_STATE_AGE,
+            )
+            .log_err();
             cleanup_old_binaries()
         })
         .detach();
@@ -870,6 +880,8 @@ pub enum ServerPathError {
 
 #[derive(Clone, Debug)]
 struct ServerPaths {
+    server_dir: PathBuf,
+    owner_file: PathBuf,
     log_file: PathBuf,
     pid_file: PathBuf,
     stdin_socket: PathBuf,
@@ -880,31 +892,42 @@ struct ServerPaths {
 impl ServerPaths {
     fn new(identifier: &str) -> Result<Self, ServerPathError> {
         let server_dir = paths::remote_server_state_dir().join(identifier);
-        std::fs::create_dir_all(&server_dir).map_err(|source| {
-            ServerPathError::CreateServerDir {
-                source,
-                path: server_dir.clone(),
-            }
-        })?;
         let log_dir = logs_dir();
         std::fs::create_dir_all(log_dir).map_err(|source| ServerPathError::CreateLogsDir {
             source,
             path: log_dir.clone(),
         })?;
 
-        let pid_file = server_dir.join("server.pid");
+        let pid_file = server_dir.join(PID_FILE_NAME);
+        let owner_file = server_dir.join(OWNER_FILE_NAME);
         let stdin_socket = server_dir.join("stdin.sock");
         let stdout_socket = server_dir.join("stdout.sock");
         let stderr_socket = server_dir.join("stderr.sock");
-        let log_file = logs_dir().join(format!("server-{}.log", identifier));
+        let log_file = server_log_file(logs_dir(), identifier);
 
         Ok(Self {
+            server_dir,
+            owner_file,
             pid_file,
             stdin_socket,
             stdout_socket,
             stderr_socket,
             log_file,
         })
+    }
+
+    fn create_server_dir(&self) -> Result<(), ServerPathError> {
+        std::fs::create_dir_all(&self.server_dir).map_err(|source| {
+            ServerPathError::CreateServerDir {
+                source,
+                path: self.server_dir.clone(),
+            }
+        })
+    }
+
+    fn is_owned_by(&self, owner: &str) -> bool {
+        std::fs::read_to_string(&self.owner_file)
+            .is_ok_and(|server_owner| server_owner.trim() == owner)
     }
 }
 
@@ -914,7 +937,21 @@ pub enum ExecuteProxyError {
     ServerPath(#[from] ServerPathError),
 
     #[error(transparent)]
-    ServerNotRunning(#[from] ProxyLaunchError),
+    ProxyLaunch(#[from] ProxyLaunchError),
+
+    #[error("Failed to lock server state in '{path}': {source:#}")]
+    LockServerState {
+        #[source]
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[error("Failed to write server owner file '{path}': {source:#}")]
+    WriteOwner {
+        #[source]
+        source: std::io::Error,
+        path: PathBuf,
+    },
 
     #[error("Failed to check PidFile '{path}': {source:#}")]
     CheckPidFile {
@@ -940,9 +977,7 @@ pub enum ExecuteProxyError {
 impl ExecuteProxyError {
     pub fn to_exit_code(&self) -> i32 {
         match self {
-            ExecuteProxyError::ServerNotRunning(proxy_launch_error) => {
-                proxy_launch_error.to_exit_code()
-            }
+            ExecuteProxyError::ProxyLaunch(proxy_launch_error) => proxy_launch_error.to_exit_code(),
             _ => 1,
         }
     }
@@ -950,6 +985,7 @@ impl ExecuteProxyError {
 
 pub(crate) fn execute_proxy(
     identifier: String,
+    owner: String,
     is_reconnecting: bool,
 ) -> Result<(), ExecuteProxyError> {
     init_logging_proxy();
@@ -981,42 +1017,42 @@ pub(crate) fn execute_proxy(
     };
     log::info!("starting proxy process. PID: {}", std::process::id());
     let server_pid = {
-        let server_pid = check_pid_file(&server_paths.pid_file).map_err(|source| {
-            ExecuteProxyError::CheckPidFile {
+        let state_dir = paths::remote_server_state_dir();
+        let _server_state_lock =
+            lock_server_state(state_dir).map_err(|source| ExecuteProxyError::LockServerState {
                 source,
-                path: server_paths.pid_file.clone(),
-            }
-        })?;
-        if is_reconnecting {
-            match server_pid {
-                None => {
-                    log::error!("attempted to reconnect, but no server running");
-                    return Err(ExecuteProxyError::ServerNotRunning(
-                        ProxyLaunchError::ServerNotRunning,
-                    ));
+                path: state_dir.clone(),
+            })?;
+        server_paths.create_server_dir()?;
+        match claim_server(&server_paths, &owner, is_reconnecting)? {
+            ServerClaim::Attach { server_pid } => server_pid,
+            ServerClaim::Spawn { replaced_pid } => {
+                if let Some(pid) = replaced_pid {
+                    log::info!(
+                        "proxy found its own server already running with PID {pid}. Killing process and cleaning up files..."
+                    );
+                    kill_running_server(pid, &server_paths)?;
                 }
-                Some(server_pid) => server_pid,
-            }
-        } else {
-            if let Some(pid) = server_pid {
-                log::info!(
-                    "proxy found server already running with PID {}. Killing process and cleaning up files...",
-                    pid
-                );
-                kill_running_server(pid, &server_paths)?;
-            }
-            gpui::block_on(spawn_server(&server_paths)).map_err(ExecuteProxyError::SpawnServer)?;
-            std::fs::read_to_string(&server_paths.pid_file)
-                .and_then(|contents| {
-                    contents.parse::<u32>().map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "Invalid PID file contents",
-                        )
+                std::fs::write(&server_paths.owner_file, &owner).map_err(|source| {
+                    ExecuteProxyError::WriteOwner {
+                        source,
+                        path: server_paths.owner_file.clone(),
+                    }
+                })?;
+                gpui::block_on(spawn_server(&server_paths))
+                    .map_err(ExecuteProxyError::SpawnServer)?;
+                std::fs::read_to_string(&server_paths.pid_file)
+                    .and_then(|contents| {
+                        contents.parse::<u32>().map_err(|_| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "Invalid PID file contents",
+                            )
+                        })
                     })
-                })
-                .map_err(SpawnServerError::ProcessStatus)
-                .map_err(ExecuteProxyError::SpawnServer)?
+                    .map_err(SpawnServerError::ProcessStatus)
+                    .map_err(ExecuteProxyError::SpawnServer)?
+            }
         }
     };
 
@@ -1086,7 +1122,7 @@ pub(crate) fn execute_proxy(
         log::error!("encountered error while forwarding messages: {forwarding_result:#}",);
         if !matches!(gpui::block_on(check_server_running(server_pid)), Ok(true)) {
             log::error!("server exited unexpectedly");
-            return Err(ExecuteProxyError::ServerNotRunning(
+            return Err(ExecuteProxyError::ProxyLaunch(
                 ProxyLaunchError::ServerNotRunning,
             ));
         }
@@ -1094,6 +1130,46 @@ pub(crate) fn execute_proxy(
     }
 
     Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ServerClaim {
+    Attach { server_pid: u32 },
+    Spawn { replaced_pid: Option<u32> },
+}
+
+fn claim_server(
+    server_paths: &ServerPaths,
+    owner: &str,
+    is_reconnecting: bool,
+) -> Result<ServerClaim, ExecuteProxyError> {
+    let server_pid = check_pid_file(&server_paths.pid_file).map_err(|source| {
+        ExecuteProxyError::CheckPidFile {
+            source,
+            path: server_paths.pid_file.clone(),
+        }
+    })?;
+    match server_pid {
+        None if is_reconnecting => {
+            log::error!("attempted to reconnect, but no server running");
+            Err(ExecuteProxyError::ProxyLaunch(
+                ProxyLaunchError::ServerNotRunning,
+            ))
+        }
+        None => Ok(ServerClaim::Spawn { replaced_pid: None }),
+        Some(server_pid) if !server_paths.is_owned_by(owner) => {
+            log::error!("server with PID {server_pid} is owned by another client");
+            Err(ExecuteProxyError::ProxyLaunch(if is_reconnecting {
+                ProxyLaunchError::ServerNotRunning
+            } else {
+                ProxyLaunchError::ServerOwnedByAnotherClient
+            }))
+        }
+        Some(server_pid) if is_reconnecting => Ok(ServerClaim::Attach { server_pid }),
+        Some(server_pid) => Ok(ServerClaim::Spawn {
+            replaced_pid: Some(server_pid),
+        }),
+    }
 }
 
 fn kill_running_server(pid: u32, paths: &ServerPaths) -> Result<(), ExecuteProxyError> {
@@ -1431,15 +1507,29 @@ fn cleanup_old_binaries() -> Result<()> {
     let prefix = format!("zed-remote-server-{}-", release_channel);
 
     for entry in std::fs::read_dir(server_dir.as_std_path())? {
-        let path = entry?.path();
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let path = entry.path();
 
         if let Some(file_name) = path.file_name()
             && let Some(version) = file_name.to_string_lossy().strip_prefix(&prefix)
-            && !is_new_version(version)
+            && if remote::is_remote_server_staging_file(version) {
+                is_stale_staging_file(&entry)
+            } else {
+                !is_new_version(version)
+            }
             && !is_file_in_use(file_name)
         {
             log::info!("removing old remote server binary: {:?}", path);
-            std::fs::remove_file(&path)?;
+            let removed = if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            removed
+                .with_context(|| format!("removing {path:?}"))
+                .log_err();
         }
     }
 
@@ -1453,6 +1543,80 @@ fn cleanup_old_binaries_wsl() {
     if let Ok(()) = std::fs::remove_dir_all(server_dir.as_std_path()) {
         log::info!("removing old wsl remote server folder: {:?}", server_dir);
     }
+}
+
+const STALE_STAGING_FILE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const STALE_SETUP_SERVER_STATE_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const PID_FILE_NAME: &str = "server.pid";
+const OWNER_FILE_NAME: &str = "server.owner";
+const SERVER_STATE_LOCK_FILE_NAME: &str = ".lock";
+
+fn lock_server_state(state_dir: &Path) -> std::io::Result<File> {
+    std::fs::create_dir_all(state_dir)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(state_dir.join(SERVER_STATE_LOCK_FILE_NAME))?;
+    lock.lock()?;
+    Ok(lock)
+}
+
+fn server_log_file(logs_dir: &Path, identifier: &str) -> PathBuf {
+    logs_dir.join(format!("server-{identifier}.log"))
+}
+
+fn cleanup_stale_setup_server_state(
+    state_dir: &Path,
+    logs_dir: &Path,
+    stale_age: Duration,
+) -> Result<()> {
+    let _server_state_lock = lock_server_state(state_dir)
+        .with_context(|| format!("locking server state in {state_dir:?}"))?;
+    for entry in std::fs::read_dir(state_dir)? {
+        let Some(entry) = entry.log_err() else {
+            continue;
+        };
+        let file_name = entry.file_name();
+        let identifier = file_name.to_string_lossy();
+        if !remote::is_setup_connection_identifier(&identifier) || !is_older_than(&entry, stale_age)
+        {
+            continue;
+        }
+        let server_dir = entry.path();
+        if !matches!(check_pid_file(&server_dir.join(PID_FILE_NAME)), Ok(None)) {
+            continue;
+        }
+
+        log::info!("removing stale remote server state: {server_dir:?}");
+        std::fs::remove_dir_all(&server_dir)
+            .with_context(|| format!("removing {server_dir:?}"))
+            .log_err();
+        let log_file = server_log_file(logs_dir, &identifier);
+        for path in [rotated_log_path(&log_file), log_file] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::error!("removing {path:?}: {error}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_stale_staging_file(entry: &std::fs::DirEntry) -> bool {
+    is_older_than(entry, STALE_STAGING_FILE_AGE)
+}
+
+fn is_older_than(entry: &std::fs::DirEntry, age: Duration) -> bool {
+    entry
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|elapsed| elapsed >= age)
 }
 
 fn is_new_version(version: &str) -> bool {
@@ -1668,6 +1832,111 @@ mod tests {
         assert_eq!(
             std::fs::read(&log_path).expect("read active log"),
             new_contents
+        );
+    }
+
+    #[test]
+    fn claiming_a_server_never_takes_over_another_owners_running_server() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let server_dir = temp_dir.path().join("conn-0badf00d");
+        std::fs::create_dir_all(&server_dir).expect("create server dir");
+        let server_paths = ServerPaths {
+            owner_file: server_dir.join(OWNER_FILE_NAME),
+            log_file: temp_dir.path().join("server.log"),
+            pid_file: server_dir.join(PID_FILE_NAME),
+            stdin_socket: server_dir.join("stdin.sock"),
+            stdout_socket: server_dir.join("stdout.sock"),
+            stderr_socket: server_dir.join("stderr.sock"),
+            server_dir,
+        };
+        let claim = |is_reconnecting| {
+            claim_server(&server_paths, "mine", is_reconnecting)
+                .map_err(|error| error.to_exit_code())
+        };
+        let server_not_running = ProxyLaunchError::ServerNotRunning.to_exit_code();
+        let owned_by_another = ProxyLaunchError::ServerOwnedByAnotherClient.to_exit_code();
+        let running_pid = std::process::id();
+
+        let without_server = [claim(false), claim(true)];
+        std::fs::write(&server_paths.pid_file, running_pid.to_string()).expect("write pid file");
+        let without_owner = [claim(false), claim(true)];
+        std::fs::write(&server_paths.owner_file, "theirs").expect("write owner file");
+        let foreign = [claim(false), claim(true)];
+        std::fs::write(&server_paths.owner_file, "mine\n").expect("write owner file");
+        let own = [claim(false), claim(true)];
+
+        assert_eq!(
+            [without_server, without_owner, foreign, own],
+            [
+                [
+                    Ok(ServerClaim::Spawn { replaced_pid: None }),
+                    Err(server_not_running)
+                ],
+                [Err(owned_by_another), Err(server_not_running)],
+                [Err(owned_by_another), Err(server_not_running)],
+                [
+                    Ok(ServerClaim::Spawn {
+                        replaced_pid: Some(running_pid)
+                    }),
+                    Ok(ServerClaim::Attach {
+                        server_pid: running_pid
+                    })
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_stopped_setup_server_state() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_dir = temp_dir.path().join("server_state");
+        let logs_dir = temp_dir.path().join("logs");
+        std::fs::create_dir_all(&logs_dir).expect("create logs dir");
+        let running_pid = std::process::id().to_string();
+        for (identifier, pid) in [
+            ("conn-0badf00d", None),
+            ("preview-conn-12", None),
+            ("conn-cafe0001", Some(running_pid.as_str())),
+            ("ws-3", None),
+        ] {
+            let server_dir = state_dir.join(identifier);
+            std::fs::create_dir_all(&server_dir).expect("create server dir");
+            if let Some(pid) = pid {
+                std::fs::write(server_dir.join(PID_FILE_NAME), pid).expect("write pid file");
+            }
+            let log_file = server_log_file(&logs_dir, identifier);
+            std::fs::write(rotated_log_path(&log_file), "").expect("write rotated log");
+            std::fs::write(log_file, "").expect("write log");
+        }
+
+        cleanup_stale_setup_server_state(&state_dir, &logs_dir, Duration::ZERO)
+            .expect("cleanup server state");
+
+        let remaining = [&state_dir, &logs_dir].map(|dir| {
+            let mut names = std::fs::read_dir(dir)
+                .expect("read dir")
+                .map(|entry| {
+                    entry
+                        .expect("dir entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        });
+        assert_eq!(
+            remaining,
+            [
+                vec![".lock", "conn-cafe0001", "ws-3"],
+                vec![
+                    "server-conn-cafe0001.1.log",
+                    "server-conn-cafe0001.log",
+                    "server-ws-3.1.log",
+                    "server-ws-3.log",
+                ],
+            ]
         );
     }
 

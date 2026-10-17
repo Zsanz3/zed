@@ -1,11 +1,15 @@
 //! Module for managing breakpoints in a project.
 //!
 //! Breakpoints are separate from a session because they're not associated with any particular debug session. They can also be set up without a session running.
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 pub use breakpoints_in_file::{BreakpointSessionState, BreakpointWithPosition};
 use breakpoints_in_file::{BreakpointsInFile, StatefulBreakpoint};
-use collections::{BTreeMap, HashMap};
+use collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use dap::{StackFrameId, client::SessionId};
+use futures::{
+    StreamExt as _,
+    channel::{mpsc, oneshot},
+};
 use gpui::{
     App, AppContext, AsyncApp, Context, Entity, EntityId, EventEmitter, Subscription, Task,
 };
@@ -15,16 +19,20 @@ use rpc::{
     AnyProtoClient, TypedEnvelope,
     proto::{self},
 };
-use std::{hash::Hash, ops::Range, path::Path, sync::Arc};
+use std::{cell::Cell, hash::Hash, ops::Range, path::Path, sync::Arc};
 use text::{Bias, Point, PointUtf16, Unclipped};
-use util::maybe;
+use util::{ResultExt as _, maybe};
 
-use crate::{ProjectPath, buffer_store::BufferStore, worktree_store::WorktreeStore};
+use crate::{
+    ProjectPath,
+    buffer_store::{BufferStore, BufferStoreEvent},
+    worktree_store::WorktreeStore,
+};
 
 use super::session::ThreadId;
 
 mod breakpoints_in_file {
-    use collections::HashMap;
+    use collections::{HashMap, HashSet};
     use language::BufferEvent;
 
     use super::*;
@@ -84,12 +92,12 @@ mod breakpoints_in_file {
                     BufferEvent::FileHandleChanged => {
                         let entity_id = buffer.entity_id();
 
-                        if buffer.read(cx).file().is_none_or(|f| f.disk_state().is_deleted()) {
-                            breakpoint_store.breakpoints.retain(|_, breakpoints_in_file| {
-                                breakpoints_in_file.buffer.entity_id() != entity_id
-                            });
-
-                            cx.notify();
+                        if buffer
+                            .read(cx)
+                            .file()
+                            .is_none_or(|f| f.disk_state().is_deleted())
+                        {
+                            breakpoint_store.remove_breakpoints_of_buffer(entity_id, cx);
                             return;
                         }
 
@@ -105,14 +113,7 @@ mod breakpoints_in_file {
                                 .map(|values| values.0)
                                 .cloned()
                             {
-                                let Some(breakpoints_in_file) =
-                                    breakpoint_store.breakpoints.remove(&old_path) else {
-                                        log::error!("Couldn't get breakpoints in file from old path during buffer rename handling");
-                                        return;
-                                    };
-
-                                breakpoint_store.breakpoints.insert(abs_path, breakpoints_in_file);
-                                cx.notify();
+                                breakpoint_store.on_file_rename(old_path, abs_path, cx);
                             }
                         }
                     }
@@ -127,32 +128,39 @@ mod breakpoints_in_file {
             }
         }
 
-        pub(super) fn migrate_to(
+        pub(super) fn merge_restored(
             &mut self,
-            buffer: Entity<Buffer>,
-            cx: &mut Context<BreakpointStore>,
-        ) {
-            if self.buffer == buffer {
-                return;
-            }
-            let old_snapshot = self.buffer.read(cx).snapshot();
-            let new_snapshot = buffer.read(cx).snapshot();
-            let breakpoints = self
+            restored: BreakpointsInFile,
+            cx: &App,
+        ) -> Vec<text::Anchor> {
+            let source = restored.buffer.read(cx).snapshot();
+            let destination = self.buffer.read(cx).snapshot();
+            let same_buffer = restored.buffer == self.buffer;
+            let max_row = destination.max_point_utf16().row;
+            let mut added = Vec::new();
+            let mut occupied_rows = self
                 .breakpoints
-                .drain(..)
-                .map(|mut breakpoint| {
-                    let old_position =
-                        old_snapshot.summary_for_anchor::<PointUtf16>(breakpoint.position());
-                    let new_position = new_snapshot.clip_point_utf16(
-                        Unclipped(PointUtf16::new(old_position.row, 0)),
-                        Bias::Left,
-                    );
-                    breakpoint.bp.position = new_snapshot.anchor_after(new_position);
-                    breakpoint
+                .iter()
+                .map(|breakpoint| {
+                    destination
+                        .summary_for_anchor::<PointUtf16>(breakpoint.position())
+                        .row
                 })
-                .collect();
-            *self = BreakpointsInFile::new(buffer, cx);
-            self.breakpoints = breakpoints;
+                .collect::<HashSet<_>>();
+            for mut breakpoint in restored.breakpoints {
+                let row = source
+                    .summary_for_anchor::<PointUtf16>(breakpoint.position())
+                    .row;
+                if row > max_row || !occupied_rows.insert(row) {
+                    continue;
+                }
+                if !same_buffer {
+                    breakpoint.bp.position = destination.anchor_after(PointUtf16::new(row, 0));
+                }
+                added.push(*breakpoint.position());
+                self.breakpoints.push(breakpoint);
+            }
+            added
         }
     }
 }
@@ -182,11 +190,35 @@ pub struct BreakpointStore {
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
     breakpoints: BTreeMap<Arc<Path>, BreakpointsInFile>,
+    pending_restored: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>,
+    restoring_paths: collections::HashSet<Arc<Path>>,
+    pending_restored_buffers: Option<Subscription>,
     downstream_client: Option<(AnyProtoClient, u64)>,
     active_stack_frame: Option<ActiveStackFrame>,
     active_debug_line_pane_id: Option<EntityId>,
+    remote_snapshots_in_flight: HashMap<Arc<Path>, u64>,
+    remote_snapshots_received: u64,
+    remote_snapshot_versions: HashMap<Arc<Path>, u64>,
+    downstream_version: Cell<u64>,
+    collaborators: HashSet<proto::PeerId>,
+    remote_edits: HashMap<RemoteEditSender, VecDeque<RemoteBreakpointEdit>>,
+    remote_edit_buffers: HashMap<EntityId, Subscription>,
+    upstream_requests: Option<(mpsc::UnboundedSender<proto::ToggleBreakpoint>, Task<()>)>,
     // E.g ssh
     mode: BreakpointStoreMode,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum RemoteEditSender {
+    Collaborator(proto::PeerId),
+    Direct(proto::PeerId),
+}
+
+struct RemoteBreakpointEdit {
+    buffer: Entity<Buffer>,
+    breakpoint: BreakpointWithPosition,
+    edit: proto::BreakpointEdit,
+    applied: oneshot::Sender<Result<()>>,
 }
 
 impl BreakpointStore {
@@ -197,12 +229,23 @@ impl BreakpointStore {
     pub fn local(worktree_store: Entity<WorktreeStore>, buffer_store: Entity<BufferStore>) -> Self {
         BreakpointStore {
             breakpoints: BTreeMap::new(),
+            pending_restored: BTreeMap::new(),
+            restoring_paths: collections::HashSet::default(),
+            pending_restored_buffers: None,
             mode: BreakpointStoreMode::Local,
             buffer_store,
             worktree_store,
             downstream_client: None,
             active_stack_frame: Default::default(),
             active_debug_line_pane_id: None,
+            remote_snapshots_in_flight: HashMap::default(),
+            remote_snapshots_received: 0,
+            remote_snapshot_versions: HashMap::default(),
+            downstream_version: Cell::new(0),
+            collaborators: HashSet::default(),
+            remote_edits: HashMap::default(),
+            remote_edit_buffers: HashMap::default(),
+            upstream_requests: None,
         }
     }
 
@@ -214,6 +257,9 @@ impl BreakpointStore {
     ) -> Self {
         BreakpointStore {
             breakpoints: BTreeMap::new(),
+            pending_restored: BTreeMap::new(),
+            restoring_paths: collections::HashSet::default(),
+            pending_restored_buffers: None,
             mode: BreakpointStoreMode::Remote(RemoteBreakpointStore {
                 upstream_client,
                 upstream_project_id,
@@ -223,6 +269,14 @@ impl BreakpointStore {
             downstream_client: None,
             active_stack_frame: Default::default(),
             active_debug_line_pane_id: None,
+            remote_snapshots_in_flight: HashMap::default(),
+            remote_snapshots_received: 0,
+            remote_snapshot_versions: HashMap::default(),
+            downstream_version: Cell::new(0),
+            collaborators: HashSet::default(),
+            remote_edits: HashMap::default(),
+            remote_edit_buffers: HashMap::default(),
+            upstream_requests: None,
         }
     }
 
@@ -232,8 +286,52 @@ impl BreakpointStore {
 
     pub(crate) fn unshared(&mut self, cx: &mut Context<Self>) {
         self.downstream_client.take();
+        self.collaborators.clear();
+        self.remote_edits.clear();
+        self.remote_edit_buffers.clear();
 
         cx.notify();
+    }
+
+    pub(crate) fn set_collaborators(
+        &mut self,
+        collaborators: impl IntoIterator<Item = proto::PeerId>,
+    ) {
+        self.collaborators = collaborators.into_iter().collect();
+        let collaborators = &self.collaborators;
+        self.remote_edits.retain(|sender, _| match sender {
+            RemoteEditSender::Collaborator(peer_id) => collaborators.contains(peer_id),
+            RemoteEditSender::Direct(_) => true,
+        });
+        self.retain_remote_edit_buffers();
+    }
+
+    pub(crate) fn collaborator_added(&mut self, peer_id: proto::PeerId) {
+        self.collaborators.insert(peer_id);
+    }
+
+    pub(crate) fn collaborator_removed(&mut self, peer_id: proto::PeerId) {
+        self.collaborators.remove(&peer_id);
+        self.remote_edits
+            .remove(&RemoteEditSender::Collaborator(peer_id));
+        self.retain_remote_edit_buffers();
+    }
+
+    pub(crate) fn collaborator_renamed(
+        &mut self,
+        old_peer_id: proto::PeerId,
+        new_peer_id: proto::PeerId,
+    ) {
+        if self.collaborators.remove(&old_peer_id) {
+            self.collaborators.insert(new_peer_id);
+        }
+        if let Some(edits) = self
+            .remote_edits
+            .remove(&RemoteEditSender::Collaborator(old_peer_id))
+        {
+            self.remote_edits
+                .insert(RemoteEditSender::Collaborator(new_peer_id), edits);
+        }
     }
 
     async fn handle_breakpoints_for_file(
@@ -241,61 +339,238 @@ impl BreakpointStore {
         message: TypedEnvelope<proto::BreakpointsForFile>,
         mut cx: AsyncApp,
     ) -> Result<()> {
+        let path = Arc::<Path>::from(Path::new(&message.payload.path));
+        let version = message.payload.version;
+        let snapshot = this.update(&mut cx, |this, _| {
+            if version != 0 {
+                if this
+                    .remote_snapshot_versions
+                    .get(&path)
+                    .is_some_and(|latest_version| *latest_version >= version)
+                {
+                    return None;
+                }
+                this.remote_snapshot_versions.insert(path.clone(), version);
+            }
+            this.remote_snapshots_received += 1;
+            this.remote_snapshots_in_flight
+                .insert(path.clone(), this.remote_snapshots_received);
+            Some(this.remote_snapshots_received)
+        });
+        let Some(snapshot) = snapshot else {
+            return Ok(());
+        };
         if message.payload.breakpoints.is_empty() {
+            this.update(&mut cx, |this, cx| {
+                this.finish_remote_snapshot(&path, snapshot);
+                if this.breakpoints.remove(&path).is_some() {
+                    this.send_breakpoints_downstream(&path);
+                    cx.notify();
+                }
+            });
             return Ok(());
         }
 
-        let buffer = this
-            .update(&mut cx, |this, cx| {
-                let path = this
-                    .worktree_store
-                    .read(cx)
-                    .project_path_for_absolute_path(message.payload.path.as_ref(), cx)?;
-                Some(
-                    this.buffer_store
-                        .update(cx, |this, cx| this.open_buffer(path, cx)),
-                )
+        let breakpoints = message
+            .payload
+            .breakpoints
+            .into_iter()
+            .filter_map(|breakpoint| {
+                let position = language::proto::deserialize_anchor(breakpoint.position?)?;
+                let session_state = breakpoint
+                    .session_state
+                    .iter()
+                    .map(|(session_id, state)| {
+                        let state = BreakpointSessionState {
+                            id: state.id,
+                            verified: state.verified,
+                        };
+                        (SessionId::from_proto(*session_id), state)
+                    })
+                    .collect();
+                let breakpoint = Breakpoint::from_proto(breakpoint)?;
+                let bp = BreakpointWithPosition {
+                    position,
+                    bp: breakpoint,
+                };
+
+                Some(StatefulBreakpoint { bp, session_state })
             })
-            .context("Invalid project path")?
+            .collect::<Vec<_>>();
+
+        let open_buffer = this.update(&mut cx, |this, cx| {
+            let Some(project_path) = this
+                .worktree_store
+                .read(cx)
+                .project_path_for_absolute_path(message.payload.path.as_ref(), cx)
+            else {
+                this.finish_remote_snapshot(&path, snapshot);
+                return None;
+            };
+            Some(this.buffer_store.update(cx, |buffer_store, cx| {
+                buffer_store.open_buffer(project_path, cx)
+            }))
+        });
+        let open_buffer = open_buffer.context("Invalid project path")?;
+        let buffer = async {
+            let buffer = open_buffer.await?;
+            Self::wait_for_remote_anchors(
+                &buffer,
+                breakpoints.iter().map(|breakpoint| *breakpoint.position()),
+                &mut cx,
+            )
             .await?;
+            anyhow::Ok(buffer)
+        }
+        .await;
 
         this.update(&mut cx, move |this, cx| {
-            let bps = this
-                .breakpoints
-                .entry(Arc::<Path>::from(message.payload.path.as_ref()))
-                .or_insert_with(|| BreakpointsInFile::new(buffer, cx));
-
-            bps.breakpoints = message
-                .payload
-                .breakpoints
+            if !this.finish_remote_snapshot(&path, snapshot) {
+                return anyhow::Ok(());
+            }
+            let buffer = buffer?;
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let breakpoints = breakpoints
                 .into_iter()
-                .filter_map(|breakpoint| {
-                    let position = language::proto::deserialize_anchor(breakpoint.position?)?;
-                    let session_state = breakpoint
-                        .session_state
-                        .iter()
-                        .map(|(session_id, state)| {
-                            let state = BreakpointSessionState {
-                                id: state.id,
-                                verified: state.verified,
-                            };
-                            (SessionId::from_proto(*session_id), state)
-                        })
-                        .collect();
-                    let breakpoint = Breakpoint::from_proto(breakpoint)?;
-                    let bp = BreakpointWithPosition {
-                        position,
-                        bp: breakpoint,
-                    };
-
-                    Some(StatefulBreakpoint { bp, session_state })
-                })
-                .collect();
-
+                .filter(|breakpoint| buffer_snapshot.can_resolve(breakpoint.position()))
+                .collect::<Vec<_>>();
+            let file_breakpoints = this
+                .breakpoints
+                .remove(&path)
+                .filter(|file_breakpoints| file_breakpoints.buffer == buffer);
+            if !breakpoints.is_empty() {
+                let mut file_breakpoints =
+                    file_breakpoints.unwrap_or_else(|| BreakpointsInFile::new(buffer, cx));
+                file_breakpoints.breakpoints = breakpoints;
+                this.breakpoints.insert(path.clone(), file_breakpoints);
+            }
+            this.send_breakpoints_downstream(&path);
             cx.notify();
-        });
+            anyhow::Ok(())
+        })
+    }
 
+    async fn wait_for_remote_anchors(
+        buffer: &Entity<Buffer>,
+        anchors: impl IntoIterator<Item = text::Anchor>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        buffer
+            .update(cx, |buffer, _| {
+                let buffer_id = buffer.remote_id();
+                let anchors = anchors
+                    .into_iter()
+                    .filter(|anchor| anchor.buffer_id == buffer_id)
+                    .collect::<Vec<_>>();
+                buffer.wait_for_anchors(anchors)
+            })
+            .await
+    }
+
+    fn enqueue_remote_edit(
+        &mut self,
+        sender: RemoteEditSender,
+        edit: RemoteBreakpointEdit,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if let RemoteEditSender::Collaborator(peer_id) = sender {
+            anyhow::ensure!(
+                self.collaborators.contains(&peer_id),
+                "Peer {peer_id} is not a collaborator of this project"
+            );
+        }
+        self.remote_edit_buffers
+            .entry(edit.buffer.entity_id())
+            .or_insert_with(|| {
+                cx.observe(&edit.buffer, |breakpoint_store, _, cx| {
+                    breakpoint_store.apply_remote_edits(cx)
+                })
+            });
+        self.remote_edits.entry(sender).or_default().push_back(edit);
+        self.apply_remote_edits(cx);
         Ok(())
+    }
+
+    fn apply_remote_edits(&mut self, cx: &mut Context<Self>) {
+        let senders = self.remote_edits.keys().copied().collect::<Vec<_>>();
+        for sender in senders {
+            while let Some((edit, readiness)) = self.pop_ready_remote_edit(sender, cx) {
+                let RemoteBreakpointEdit {
+                    buffer,
+                    breakpoint,
+                    edit,
+                    applied,
+                } = edit;
+                let result = readiness.map(|()| match edit {
+                    proto::BreakpointEdit::Toggle => {
+                        self.toggle_breakpoint(buffer, breakpoint, BreakpointEditAction::Toggle, cx)
+                    }
+                    proto::BreakpointEdit::Set => {
+                        self.apply_upstream_edit(buffer, breakpoint, true, cx)
+                    }
+                    proto::BreakpointEdit::Remove => {
+                        self.apply_upstream_edit(buffer, breakpoint, false, cx)
+                    }
+                    proto::BreakpointEdit::Superseded => {}
+                });
+                applied.send(result).ok();
+            }
+        }
+        self.retain_remote_edit_buffers();
+    }
+
+    fn retain_remote_edit_buffers(&mut self) {
+        let remote_edits = &self.remote_edits;
+        self.remote_edit_buffers.retain(|buffer_id, _| {
+            remote_edits
+                .values()
+                .flatten()
+                .any(|edit| edit.buffer.entity_id() == *buffer_id)
+        });
+    }
+
+    fn pop_ready_remote_edit(
+        &mut self,
+        sender: RemoteEditSender,
+        cx: &App,
+    ) -> Option<(RemoteBreakpointEdit, Result<()>)> {
+        let edits = self.remote_edits.get_mut(&sender)?;
+        let readiness = match edits.front() {
+            Some(edit) => {
+                let buffer = edit.buffer.read(cx);
+                let position = edit.breakpoint.position;
+                if position.buffer_id != buffer.remote_id() {
+                    Err(anyhow!(
+                        "Breakpoint position {position:?} belongs to another buffer"
+                    ))
+                } else if buffer.can_resolve(&position) {
+                    Ok(())
+                } else if position.timestamp().replica_id == buffer.replica_id() {
+                    Err(anyhow!(
+                        "Breakpoint position {position:?} refers to an edit this replica never made"
+                    ))
+                } else {
+                    return None;
+                }
+            }
+            None => {
+                self.remote_edits.remove(&sender);
+                return None;
+            }
+        };
+        let edit = edits.pop_front()?;
+        if edits.is_empty() {
+            self.remote_edits.remove(&sender);
+        }
+        Some((edit, readiness))
+    }
+
+    fn finish_remote_snapshot(&mut self, path: &Arc<Path>, snapshot: u64) -> bool {
+        let latest = self.remote_snapshots_in_flight.get(path) == Some(&snapshot);
+        if latest {
+            self.remote_snapshots_in_flight.remove(path);
+        }
+        latest
     }
 
     async fn handle_toggle_breakpoint(
@@ -303,6 +578,10 @@ impl BreakpointStore {
         message: TypedEnvelope<proto::ToggleBreakpoint>,
         mut cx: AsyncApp,
     ) -> Result<proto::Ack> {
+        let sender = match message.original_sender_id {
+            Some(peer_id) => RemoteEditSender::Collaborator(peer_id),
+            None => RemoteEditSender::Direct(message.sender_id),
+        };
         let path = this
             .update(&mut cx, |this, cx| {
                 this.worktree_store
@@ -315,6 +594,7 @@ impl BreakpointStore {
                 this.buffer_store.read(cx).get_by_path(&path)
             })
             .context("Could not find buffer for a given path")?;
+        let edit = message.payload.edit();
         let breakpoint = message
             .payload
             .breakpoint
@@ -327,40 +607,33 @@ impl BreakpointStore {
         .context("Anchor deserialization failed")?;
         let breakpoint =
             Breakpoint::from_proto(breakpoint).context("Could not deserialize breakpoint")?;
+        let breakpoint = BreakpointWithPosition {
+            position,
+            bp: breakpoint,
+        };
 
+        let (applied, edit_applied) = oneshot::channel();
         this.update(&mut cx, |this, cx| {
-            this.toggle_breakpoint(
-                buffer,
-                BreakpointWithPosition {
-                    position,
-                    bp: breakpoint,
+            this.enqueue_remote_edit(
+                sender,
+                RemoteBreakpointEdit {
+                    buffer,
+                    breakpoint,
+                    edit,
+                    applied,
                 },
-                BreakpointEditAction::Toggle,
                 cx,
-            );
-        });
+            )
+        })?;
+        edit_applied
+            .await
+            .context("Breakpoint edit was cancelled")??;
         Ok(proto::Ack {})
     }
 
     pub(crate) fn broadcast(&self) {
-        if let Some((client, project_id)) = &self.downstream_client {
-            for (path, breakpoint_set) in &self.breakpoints {
-                let _ = client.send(proto::BreakpointsForFile {
-                    project_id: *project_id,
-                    path: path.to_string_lossy().into_owned(),
-                    breakpoints: breakpoint_set
-                        .breakpoints
-                        .iter()
-                        .filter_map(|breakpoint| {
-                            breakpoint.bp.bp.to_proto(
-                                path,
-                                breakpoint.position(),
-                                &breakpoint.session_state,
-                            )
-                        })
-                        .collect(),
-                });
-            }
+        for path in self.breakpoints.keys() {
+            self.send_breakpoints_downstream(path);
         }
     }
 
@@ -437,14 +710,14 @@ impl BreakpointStore {
         let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
             return;
         };
+        let row = buffer
+            .read(cx)
+            .summary_for_anchor::<PointUtf16>(&breakpoint.position)
+            .row;
+        self.forget_pending_restored(&abs_path, row);
 
-        let breakpoint_set = self
-            .breakpoints
-            .entry(abs_path.clone())
-            .or_insert_with(|| BreakpointsInFile::new(buffer.clone(), cx));
-
-        // Buffers changed for the file, migrate breakpoints to the new buffer
-        breakpoint_set.migrate_to(buffer, cx);
+        let breakpoint_set = self.file_breakpoints_for_buffer(&abs_path, buffer, cx);
+        let previous_breakpoints = breakpoint_positions(&breakpoint_set.breakpoints);
 
         match edit_action {
             BreakpointEditAction::Toggle => {
@@ -579,42 +852,7 @@ impl BreakpointStore {
         if breakpoint_set.breakpoints.is_empty() {
             self.breakpoints.remove(&abs_path);
         }
-        if let BreakpointStoreMode::Remote(remote) = &self.mode {
-            if let Some(breakpoint) =
-                breakpoint
-                    .bp
-                    .to_proto(&abs_path, &breakpoint.position, &HashMap::default())
-            {
-                cx.background_spawn(remote.upstream_client.request(proto::ToggleBreakpoint {
-                    project_id: remote.upstream_project_id,
-                    path: abs_path.to_string_lossy().into_owned(),
-                    breakpoint: Some(breakpoint),
-                }))
-                .detach();
-            }
-        } else if let Some((client, project_id)) = &self.downstream_client {
-            let breakpoints = self
-                .breakpoints
-                .get(&abs_path)
-                .map(|breakpoint_set| {
-                    breakpoint_set
-                        .breakpoints
-                        .iter()
-                        .filter_map(|bp| {
-                            bp.bp
-                                .bp
-                                .to_proto(&abs_path, bp.position(), &bp.session_state)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            let _ = client.send(proto::BreakpointsForFile {
-                project_id: *project_id,
-                path: abs_path.to_string_lossy().into_owned(),
-                breakpoints,
-            });
-        }
+        self.sync_file_breakpoints(&abs_path, &previous_breakpoints, cx);
 
         cx.emit(BreakpointStoreEvent::BreakpointsUpdated(
             abs_path,
@@ -623,23 +861,250 @@ impl BreakpointStore {
         cx.notify();
     }
 
+    fn file_breakpoints_for_buffer(
+        &mut self,
+        abs_path: &Arc<Path>,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> &mut BreakpointsInFile {
+        let breakpoint_set = self
+            .breakpoints
+            .entry(abs_path.clone())
+            .or_insert_with(|| BreakpointsInFile::new(buffer.clone(), cx));
+
+        // Buffers changed for the file, migrate breakpoints to the new buffer
+        if breakpoint_set.buffer != buffer {
+            let old_snapshot = breakpoint_set.buffer.read(cx).snapshot();
+            let new_snapshot = buffer.read(cx).snapshot();
+            let breakpoints = breakpoint_set
+                .breakpoints
+                .drain(..)
+                .map(|mut breakpoint| {
+                    let old_position =
+                        old_snapshot.summary_for_anchor::<PointUtf16>(breakpoint.position());
+                    let new_position = PointUtf16::new(old_position.row, 0);
+                    let new_position =
+                        new_snapshot.clip_point_utf16(Unclipped(new_position), Bias::Left);
+                    breakpoint.bp.position = new_snapshot.anchor_after(new_position);
+                    breakpoint
+                })
+                .collect();
+            *breakpoint_set = BreakpointsInFile::new(buffer, cx);
+            breakpoint_set.breakpoints = breakpoints;
+        }
+        breakpoint_set
+    }
+
+    fn apply_upstream_edit(
+        &mut self,
+        buffer: Entity<Buffer>,
+        breakpoint: BreakpointWithPosition,
+        keep: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(abs_path) = Self::abs_path_from_buffer(&buffer, cx) else {
+            return;
+        };
+        let row = buffer
+            .read(cx)
+            .summary_for_anchor::<PointUtf16>(&breakpoint.position)
+            .row;
+        self.forget_pending_restored(&abs_path, row);
+
+        let breakpoint_set = self.file_breakpoints_for_buffer(&abs_path, buffer, cx);
+        let previous_breakpoints = breakpoint_positions(&breakpoint_set.breakpoints);
+        let existing = breakpoint_set
+            .breakpoints
+            .iter()
+            .position(|existing| existing.bp == breakpoint)
+            .or_else(|| {
+                breakpoint_set
+                    .breakpoints
+                    .iter()
+                    .position(|existing| *existing.position() == breakpoint.position)
+            });
+        match (existing, keep) {
+            (Some(index), true) => {
+                if let Some(existing) = breakpoint_set.breakpoints.get_mut(index) {
+                    existing.bp = breakpoint;
+                }
+            }
+            (None, true) => breakpoint_set
+                .breakpoints
+                .push(StatefulBreakpoint::new(breakpoint)),
+            (Some(index), false) => {
+                breakpoint_set.breakpoints.remove(index);
+            }
+            (None, false) => {}
+        }
+        let changed = breakpoint_set
+            .breakpoints
+            .iter()
+            .map(|breakpoint| &breakpoint.bp)
+            .ne(previous_breakpoints.iter());
+        if breakpoint_set.breakpoints.is_empty() {
+            self.breakpoints.remove(&abs_path);
+        }
+        self.sync_file_breakpoints(&abs_path, &previous_breakpoints, cx);
+        if !changed {
+            return;
+        }
+        cx.emit(BreakpointStoreEvent::BreakpointsUpdated(
+            abs_path,
+            BreakpointUpdatedReason::Toggled,
+        ));
+        cx.notify();
+    }
+
+    fn sync_file_breakpoints(
+        &mut self,
+        abs_path: &Arc<Path>,
+        previous_breakpoints: &[BreakpointWithPosition],
+        cx: &mut Context<Self>,
+    ) {
+        if let BreakpointStoreMode::Remote(remote) = &self.mode {
+            let upstream_client = remote.upstream_client.clone();
+            let current_breakpoints = self
+                .breakpoints
+                .get(abs_path)
+                .map(|file_breakpoints| file_breakpoints.breakpoints.as_slice())
+                .unwrap_or_default();
+            let upstream_requests = changed_breakpoints(previous_breakpoints, current_breakpoints)
+                .into_iter()
+                .flat_map(|(previous, resulting)| upstream_edits(previous, resulting))
+                .filter_map(|(breakpoint, edit)| {
+                    Self::upstream_request(remote, abs_path, breakpoint, edit)
+                })
+                .collect::<Vec<_>>();
+            for upstream_request in upstream_requests {
+                self.send_upstream(upstream_client.clone(), upstream_request, cx);
+            }
+        }
+        self.send_breakpoints_downstream(abs_path);
+    }
+
+    fn upstream_request(
+        remote: &RemoteBreakpointStore,
+        abs_path: &Path,
+        breakpoint: &BreakpointWithPosition,
+        edit: proto::BreakpointEdit,
+    ) -> Option<proto::ToggleBreakpoint> {
+        let breakpoint =
+            breakpoint
+                .bp
+                .to_proto(abs_path, &breakpoint.position, &HashMap::default())?;
+        Some(proto::ToggleBreakpoint {
+            project_id: remote.upstream_project_id,
+            path: abs_path.to_string_lossy().into_owned(),
+            breakpoint: Some(breakpoint),
+            edit: i32::from(edit),
+        })
+    }
+
+    fn send_upstream(
+        &mut self,
+        upstream_client: AnyProtoClient,
+        request: proto::ToggleBreakpoint,
+        cx: &mut Context<Self>,
+    ) {
+        let (upstream_requests, _) = self.upstream_requests.get_or_insert_with(|| {
+            let (upstream_requests, mut queued_requests) = mpsc::unbounded();
+            let task = cx.background_spawn(async move {
+                while let Some(request) = queued_requests.next().await {
+                    upstream_client.request(request).await.log_err();
+                }
+            });
+            (upstream_requests, task)
+        });
+        upstream_requests.unbounded_send(request).log_err();
+    }
+
+    fn remove_breakpoints_of_buffer(&mut self, buffer_id: EntityId, cx: &mut Context<Self>) {
+        let removed = self
+            .breakpoints
+            .iter()
+            .filter(|(_, breakpoints_in_file)| breakpoints_in_file.buffer.entity_id() == buffer_id)
+            .map(|(path, _)| path.clone())
+            .collect::<Vec<_>>();
+        if removed.is_empty() {
+            return;
+        }
+        for path in &removed {
+            self.breakpoints.remove(path);
+            self.send_breakpoints_downstream(path);
+        }
+        cx.emit(BreakpointStoreEvent::BreakpointsCleared(removed));
+        cx.notify();
+    }
+
+    fn send_breakpoints_downstream(&self, abs_path: &Arc<Path>) {
+        let Some((client, project_id)) = &self.downstream_client else {
+            return;
+        };
+        let breakpoints = self
+            .breakpoints
+            .get(abs_path)
+            .map(|breakpoint_set| {
+                breakpoint_set
+                    .breakpoints
+                    .iter()
+                    .filter_map(|bp| {
+                        bp.bp
+                            .bp
+                            .to_proto(abs_path, bp.position(), &bp.session_state)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let version = self.downstream_version.get() + 1;
+        self.downstream_version.set(version);
+        client
+            .send(proto::BreakpointsForFile {
+                project_id: *project_id,
+                path: abs_path.to_string_lossy().into_owned(),
+                breakpoints,
+                version,
+            })
+            .log_err();
+    }
+
     pub fn on_file_rename(
         &mut self,
         old_path: Arc<Path>,
         new_path: Arc<Path>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(breakpoints) = self.breakpoints.remove(&old_path) {
-            self.breakpoints.insert(new_path, breakpoints);
-
-            cx.notify();
+        if old_path == new_path {
+            return;
         }
+        let Some(breakpoints) = self.breakpoints.remove(&old_path) else {
+            return;
+        };
+        self.breakpoints.insert(new_path.clone(), breakpoints);
+        self.send_breakpoints_downstream(&old_path);
+        self.send_breakpoints_downstream(&new_path);
+        cx.emit(BreakpointStoreEvent::BreakpointsCleared(vec![old_path]));
+        cx.emit(BreakpointStoreEvent::BreakpointsUpdated(
+            new_path,
+            BreakpointUpdatedReason::Toggled,
+        ));
+        cx.notify();
     }
 
     pub fn clear_breakpoints(&mut self, cx: &mut Context<Self>) {
-        let breakpoint_paths = self.breakpoints.keys().cloned().collect();
-        self.breakpoints.clear();
-        cx.emit(BreakpointStoreEvent::BreakpointsCleared(breakpoint_paths));
+        let cleared = std::mem::take(&mut self.breakpoints);
+        for pending in self.pending_restored.values_mut() {
+            pending.clear();
+        }
+        for (path, breakpoints_in_file) in &cleared {
+            let previous_breakpoints = breakpoint_positions(&breakpoints_in_file.breakpoints);
+            self.sync_file_breakpoints(path, &previous_breakpoints, cx);
+        }
+        cx.emit(BreakpointStoreEvent::BreakpointsCleared(
+            cleared.into_keys().collect(),
+        ));
+        cx.notify();
     }
 
     pub fn breakpoints<'a>(
@@ -827,26 +1292,123 @@ impl BreakpointStore {
             .collect()
     }
 
-    pub fn with_serialized_breakpoints(
+    pub fn begin_restoring(&mut self, breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>) {
+        if !self.restores_saved_breakpoints() {
+            return;
+        }
+        for (path, restored) in breakpoints {
+            if restored.is_empty() || self.restoring_paths.contains(&path) {
+                continue;
+            }
+            self.restoring_paths.insert(path.clone());
+            let pending = self.pending_restored.entry(path).or_default();
+            for breakpoint in restored {
+                if !pending.iter().any(|pending| pending.row == breakpoint.row) {
+                    pending.push(breakpoint);
+                }
+            }
+        }
+    }
+
+    pub fn source_breakpoints_to_persist(
         &self,
+        cx: &App,
+    ) -> BTreeMap<Arc<Path>, Vec<SourceBreakpoint>> {
+        let mut breakpoints = self.all_source_breakpoints(cx);
+        for (path, pending) in &self.pending_restored {
+            let live_rows = breakpoints
+                .get(path)
+                .map(|live| {
+                    live.iter()
+                        .map(|breakpoint| breakpoint.row)
+                        .collect::<collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let restored = pending
+                .iter()
+                .filter(|breakpoint| !live_rows.contains(&breakpoint.row))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !restored.is_empty() {
+                breakpoints
+                    .entry(path.clone())
+                    .or_default()
+                    .extend(restored);
+            }
+        }
+        breakpoints
+    }
+
+    pub fn with_serialized_breakpoints(
+        &mut self,
         breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>,
         cx: &mut Context<BreakpointStore>,
     ) -> Task<Result<()>> {
-        if let BreakpointStoreMode::Local = &self.mode {
-            let worktree_store = self.worktree_store.downgrade();
-            let buffer_store = self.buffer_store.downgrade();
-            cx.spawn(async move |this, cx| {
-                let mut new_breakpoints = BTreeMap::default();
-                for (path, bps) in breakpoints {
-                    if bps.is_empty() {
-                        continue;
-                    }
+        self.begin_restoring(breakpoints);
+        self.finish_restoring(cx)
+    }
+
+    pub fn restore_pending_for_paths(
+        &mut self,
+        project_paths: impl IntoIterator<Item = ProjectPath>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_restored.is_empty() {
+            return;
+        }
+        let buffers = project_paths
+            .into_iter()
+            .filter_map(|project_path| self.buffer_store.read(cx).get_by_path(&project_path))
+            .collect::<Vec<_>>();
+        for buffer in buffers {
+            self.restore_pending_in_buffer(&buffer, cx);
+        }
+    }
+
+    pub fn finish_restoring(&mut self, cx: &mut Context<BreakpointStore>) -> Task<Result<()>> {
+        if !self.restores_saved_breakpoints() {
+            return Task::ready(Ok(()));
+        }
+        let open_buffers = self
+            .pending_restored
+            .keys()
+            .filter_map(|path| {
+                let project_path = self
+                    .worktree_store
+                    .read(cx)
+                    .project_path_for_absolute_path(path, cx)?;
+                self.buffer_store.read(cx).get_by_path(&project_path)
+            })
+            .collect::<Vec<_>>();
+        for buffer in open_buffers {
+            self.restore_pending_in_buffer(&buffer, cx);
+        }
+        if self.pending_restored.is_empty() {
+            return Task::ready(Ok(()));
+        }
+        self.pending_restored_buffers = Some(cx.subscribe(
+            &self.buffer_store,
+            |breakpoint_store, _, event, cx| {
+                if let BufferStoreEvent::BufferAdded(buffer) = event {
+                    breakpoint_store.restore_pending_in_buffer(buffer, cx);
+                }
+            },
+        ));
+        let paths = self.pending_restored.keys().cloned().collect::<Vec<_>>();
+        let worktree_store = self.worktree_store.downgrade();
+        let buffer_store = self.buffer_store.downgrade();
+        cx.spawn(async move |this, cx| {
+            for path in paths {
+                if !this.read_with(cx, |this, _| this.pending_restored.contains_key(&path))? {
+                    continue;
+                }
+                let buffer = async {
                     let (worktree, relative_path) = worktree_store
                         .update(cx, |this, cx| {
                             this.find_or_create_worktree(&path, false, cx)
                         })?
                         .await?;
-                    let buffer = buffer_store
+                    buffer_store
                         .update(cx, |this, cx| {
                             let path = ProjectPath {
                                 worktree_id: worktree.read(cx).id(),
@@ -854,84 +1416,114 @@ impl BreakpointStore {
                             };
                             this.open_buffer(path, cx)
                         })?
-                        .await;
-                    let Ok(buffer) = buffer else {
-                        log::error!("Todo: Serialized breakpoints which do not have buffer (yet)");
-                        continue;
-                    };
-                    let snapshot = buffer.read_with(cx, |buffer, _| buffer.snapshot());
-
-                    let mut breakpoints_for_file =
-                        this.update(cx, |_, cx| BreakpointsInFile::new(buffer, cx))?;
-
-                    for bp in bps {
-                        let max_point = snapshot.max_point_utf16();
-                        let point = PointUtf16::new(bp.row, 0);
-                        if point > max_point {
-                            log::error!("skipping a deserialized breakpoint that's out of range");
-                            continue;
-                        }
-                        let position = snapshot.anchor_after(point);
-                        breakpoints_for_file
-                            .breakpoints
-                            .push(StatefulBreakpoint::new(BreakpointWithPosition {
-                                position,
-                                bp: Breakpoint {
-                                    message: bp.message,
-                                    state: bp.state,
-                                    condition: bp.condition,
-                                    hit_condition: bp.hit_condition,
-                                },
-                            }))
-                    }
-                    new_breakpoints.insert(path, breakpoints_for_file);
+                        .await
                 }
-                this.update(cx, |this, cx| {
-                    for (path, mut live) in std::mem::take(&mut this.breakpoints) {
-                        if let Some(mut restored) = new_breakpoints.remove(&path) {
-                            restored.migrate_to(live.buffer.clone(), cx);
-                            let snapshot = live.buffer.read(cx).snapshot();
-                            let row = |breakpoint: &StatefulBreakpoint| {
-                                snapshot
-                                    .summary_for_anchor::<PointUtf16>(breakpoint.position())
-                                    .row
-                            };
-                            let live_rows = live.breakpoints.iter().map(row).collect::<Vec<_>>();
-                            live.breakpoints.extend(
-                                restored
-                                    .breakpoints
-                                    .into_iter()
-                                    .filter(|breakpoint| !live_rows.contains(&row(breakpoint))),
+                .await;
+                this.update(cx, |this, cx| match buffer {
+                    Ok(buffer) => this.restore_pending_in_buffer(&buffer, cx),
+                    Err(error) => {
+                        if let Some(pending) = this.pending_restored.get(&path) {
+                            log::warn!(
+                                "Keeping {} breakpoints of {path:?} until it can be opened: {error:#}",
+                                pending.len()
                             );
                         }
-                        new_breakpoints.insert(path, live);
                     }
-                    for (path, count) in new_breakpoints.iter().map(|(path, bp_in_file)| {
-                        (path.to_string_lossy(), bp_in_file.breakpoints.len())
-                    }) {
-                        let breakpoint_str = if count > 1 {
-                            "breakpoints"
-                        } else {
-                            "breakpoint"
-                        };
-                        log::debug!("Deserialized {count} {breakpoint_str} at path: {path}");
-                    }
-
-                    this.breakpoints = new_breakpoints;
-
-                    cx.notify();
                 })?;
-
-                Ok(())
+            }
+            this.update(cx, |this, _| {
+                if this.pending_restored.is_empty() {
+                    this.pending_restored_buffers = None;
+                }
             })
-        } else {
-            Task::ready(Ok(()))
+        })
+    }
+
+    fn restore_pending_in_buffer(&mut self, buffer: &Entity<Buffer>, cx: &mut Context<Self>) {
+        let Some(path) = Self::abs_path_from_buffer(buffer, cx) else {
+            return;
+        };
+        let Some(pending) = self.pending_restored.remove(&path) else {
+            return;
+        };
+        self.restoring_paths.remove(&path);
+        let snapshot = buffer.read(cx).snapshot();
+        let max_point = snapshot.max_point_utf16();
+        let mut restored = BreakpointsInFile::new(buffer.clone(), cx);
+        for breakpoint in pending {
+            let point = PointUtf16::new(breakpoint.row, 0);
+            if point > max_point {
+                log::error!("skipping a deserialized breakpoint that's out of range");
+                continue;
+            }
+            restored
+                .breakpoints
+                .push(StatefulBreakpoint::new(BreakpointWithPosition {
+                    position: snapshot.anchor_after(point),
+                    bp: Breakpoint {
+                        message: breakpoint.message,
+                        state: breakpoint.state,
+                        condition: breakpoint.condition,
+                        hit_condition: breakpoint.hit_condition,
+                    },
+                }));
+        }
+        let previous_breakpoints = self
+            .breakpoints
+            .get(&path)
+            .map(|live| breakpoint_positions(&live.breakpoints))
+            .unwrap_or_default();
+        let added = match self.breakpoints.get_mut(&path) {
+            Some(live) => live.merge_restored(restored, cx),
+            None => {
+                let added = restored
+                    .breakpoints
+                    .iter()
+                    .map(|breakpoint| *breakpoint.position())
+                    .collect::<Vec<_>>();
+                if !added.is_empty() {
+                    self.breakpoints.insert(path.clone(), restored);
+                }
+                added
+            }
+        };
+        if self.pending_restored.is_empty() {
+            self.pending_restored_buffers = None;
+        }
+        if !added.is_empty() {
+            self.sync_file_breakpoints(&path, &previous_breakpoints, cx);
+            cx.emit(BreakpointStoreEvent::BreakpointsUpdated(
+                path,
+                BreakpointUpdatedReason::Toggled,
+            ));
+        }
+        cx.notify();
+    }
+
+    fn restores_saved_breakpoints(&self) -> bool {
+        match &self.mode {
+            BreakpointStoreMode::Local => true,
+            BreakpointStoreMode::Remote(remote) => !remote.upstream_client.is_via_collab(),
+        }
+    }
+
+    fn forget_pending_restored(&mut self, path: &Path, row: u32) {
+        if let Some(pending) = self.pending_restored.get_mut(path) {
+            pending.retain(|breakpoint| breakpoint.row != row);
         }
     }
 
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn breakpoint_paths(&self) -> Vec<Arc<Path>> {
         self.breakpoints.keys().cloned().collect()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn pending_remote_edits(&self) -> (usize, usize) {
+        (
+            self.remote_edits.values().map(VecDeque::len).sum(),
+            self.remote_edit_buffers.len(),
+        )
     }
 }
 
@@ -1105,5 +1697,335 @@ impl From<SourceBreakpoint> for dap::SourceBreakpoint {
             log_message: bp.message.map(|message| String::from(message.as_ref())),
             mode: None,
         }
+    }
+}
+
+fn upstream_edits<'a>(
+    previous: Option<&'a BreakpointWithPosition>,
+    resulting: Option<&'a BreakpointWithPosition>,
+) -> Vec<(&'a BreakpointWithPosition, proto::BreakpointEdit)> {
+    match (previous, resulting) {
+        (None, None) => Vec::new(),
+        (Some(previous), Some(resulting)) if previous == resulting => Vec::new(),
+        (None, Some(resulting)) => Vec::from([(resulting, proto::BreakpointEdit::Set)]),
+        (Some(previous), None) => Vec::from([(previous, proto::BreakpointEdit::Remove)]),
+        (Some(previous), Some(resulting)) => Vec::from([
+            (previous, proto::BreakpointEdit::Superseded),
+            (resulting, proto::BreakpointEdit::Set),
+        ]),
+    }
+}
+
+fn breakpoint_positions(breakpoints: &[StatefulBreakpoint]) -> Vec<BreakpointWithPosition> {
+    breakpoints
+        .iter()
+        .map(|breakpoint| breakpoint.bp.clone())
+        .collect()
+}
+
+fn changed_breakpoints<'a>(
+    previous: &'a [BreakpointWithPosition],
+    current: &'a [StatefulBreakpoint],
+) -> Vec<(
+    Option<&'a BreakpointWithPosition>,
+    Option<&'a BreakpointWithPosition>,
+)> {
+    let mut unmatched = current
+        .iter()
+        .map(|breakpoint| &breakpoint.bp)
+        .collect::<Vec<_>>();
+    let mut changes = previous
+        .iter()
+        .map(|previous| {
+            let resulting = unmatched
+                .iter()
+                .position(|current| *current == previous)
+                .or_else(|| {
+                    unmatched
+                        .iter()
+                        .position(|current| current.position == previous.position)
+                })
+                .map(|index| unmatched.remove(index));
+            (Some(previous), resulting)
+        })
+        .collect::<Vec<_>>();
+    changes.extend(unmatched.into_iter().map(|current| (None, Some(current))));
+    changes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Project;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use util::{path, rel_path::rel_path};
+
+    #[gpui::test]
+    async fn test_toggle_breakpoint_requests_are_gated_by_collaborators(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/a"), json!({ "test.txt": "one\ntwo" }))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/a"))], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project.worktrees(cx).next().unwrap().read(cx).id()
+        });
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_buffer((worktree_id, rel_path("test.txt")), cx)
+            })
+            .await
+            .unwrap();
+        let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+        let guest = proto::PeerId { owner_id: 1, id: 7 };
+        let not_a_collaborator = format!("Peer {guest} is not a collaborator of this project");
+
+        let before_joining = toggle_breakpoint_from(&breakpoint_store, &buffer, guest, cx).await;
+        breakpoint_store.update(cx, |breakpoint_store, _| {
+            breakpoint_store.collaborator_added(guest)
+        });
+        let after_joining = toggle_breakpoint_from(&breakpoint_store, &buffer, guest, cx).await;
+        breakpoint_store.update(cx, |breakpoint_store, _| {
+            breakpoint_store.collaborator_removed(guest)
+        });
+        let after_leaving = toggle_breakpoint_from(&breakpoint_store, &buffer, guest, cx).await;
+
+        assert_eq!(
+            (
+                before_joining,
+                after_joining,
+                after_leaving,
+                breakpoint_store.read_with(cx, |breakpoint_store, cx| {
+                    breakpoint_store
+                        .all_source_breakpoints(cx)
+                        .into_values()
+                        .flatten()
+                        .map(|breakpoint| breakpoint.row)
+                        .collect::<Vec<_>>()
+                }),
+            ),
+            (
+                Err(not_a_collaborator.clone()),
+                Ok(proto::Ack {}),
+                Err(not_a_collaborator),
+                Vec::from([1]),
+            )
+        );
+    }
+
+    #[gpui::test]
+    async fn test_upstream_edits_converge_on_hosts_that_only_toggle(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let mut histories = Vec::new();
+        for host_only_toggles in [true, false] {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/a"), json!({ "test.txt": "one\ntwo" }))
+                .await;
+            let project = Project::test(fs, [Path::new(path!("/a"))], cx).await;
+            let buffer = project
+                .update(cx, |project, cx| {
+                    project.open_local_buffer(path!("/a/test.txt"), cx)
+                })
+                .await
+                .unwrap();
+            let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+            let enabled = BreakpointWithPosition {
+                position: buffer.read_with(cx, |buffer, _| buffer.anchor_before(Point::new(1, 0))),
+                bp: Breakpoint::new_standard(),
+            };
+            let disabled = BreakpointWithPosition {
+                bp: Breakpoint {
+                    state: BreakpointState::Disabled,
+                    ..enabled.bp.clone()
+                },
+                ..enabled.clone()
+            };
+            let mut history = Vec::new();
+            for (previous, resulting) in [
+                (None, Some(&enabled)),
+                (Some(&enabled), Some(&disabled)),
+                (Some(&disabled), Some(&disabled)),
+                (Some(&disabled), None),
+            ] {
+                for (breakpoint, edit) in upstream_edits(previous, resulting) {
+                    if host_only_toggles {
+                        breakpoint_store.update(cx, |breakpoint_store, cx| {
+                            breakpoint_store.toggle_breakpoint(
+                                buffer.clone(),
+                                breakpoint.clone(),
+                                BreakpointEditAction::Toggle,
+                                cx,
+                            )
+                        });
+                    } else {
+                        send_upstream_edit(&breakpoint_store, breakpoint, edit, cx)
+                            .await
+                            .unwrap();
+                    }
+                }
+                history.push(breakpoint_store.read_with(cx, |breakpoint_store, cx| {
+                    breakpoint_store
+                        .all_source_breakpoints(cx)
+                        .into_values()
+                        .flatten()
+                        .map(|breakpoint| (breakpoint.row, breakpoint.state))
+                        .collect::<Vec<_>>()
+                }));
+            }
+            histories.push(history);
+        }
+
+        let expected = Vec::from([
+            Vec::from([(1, BreakpointState::Enabled)]),
+            Vec::from([(1, BreakpointState::Disabled)]),
+            Vec::from([(1, BreakpointState::Disabled)]),
+            Vec::new(),
+        ]);
+        assert_eq!(histories, Vec::from([expected.clone(), expected]));
+    }
+
+    #[gpui::test]
+    async fn test_upstream_edits_keep_other_breakpoints_on_a_joined_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/a"), json!({ "test.txt": "aaa\nbbb\n" }))
+            .await;
+        let project = Project::test(fs, [Path::new(path!("/a"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer(path!("/a/test.txt"), cx)
+            })
+            .await
+            .unwrap();
+        let breakpoint_store = project.read_with(cx, |project, _| project.breakpoint_store());
+        let [first, second] = [0, 1].map(|row| BreakpointWithPosition {
+            position: buffer.read_with(cx, |buffer, _| buffer.anchor_after(Point::new(row, 0))),
+            bp: Breakpoint::new_standard(),
+        });
+        for breakpoint in [&first, &second] {
+            breakpoint_store.update(cx, |breakpoint_store, cx| {
+                breakpoint_store.toggle_breakpoint(
+                    buffer.clone(),
+                    breakpoint.clone(),
+                    BreakpointEditAction::Toggle,
+                    cx,
+                )
+            });
+        }
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(0, 3)..Point::new(1, 0), "")], None, cx)
+        });
+
+        let disabled_first = BreakpointWithPosition {
+            bp: Breakpoint {
+                state: BreakpointState::Disabled,
+                ..first.bp.clone()
+            },
+            ..first.clone()
+        };
+        let previous = [second.clone(), first];
+        let current = [second, disabled_first].map(StatefulBreakpoint::new);
+        let edits = changed_breakpoints(&previous, &current)
+            .into_iter()
+            .flat_map(|(previous, resulting)| upstream_edits(previous, resulting))
+            .map(|(breakpoint, edit)| (breakpoint.clone(), edit))
+            .collect::<Vec<_>>();
+        for (breakpoint, edit) in &edits {
+            send_upstream_edit(&breakpoint_store, breakpoint, *edit, cx)
+                .await
+                .unwrap();
+        }
+        buffer.update(cx, |buffer, cx| buffer.undo(cx));
+
+        assert_eq!(
+            (
+                edits.into_iter().map(|(_, edit)| edit).collect::<Vec<_>>(),
+                breakpoint_store.read_with(cx, |breakpoint_store, cx| {
+                    breakpoint_store
+                        .all_source_breakpoints(cx)
+                        .into_values()
+                        .flatten()
+                        .map(|breakpoint| (breakpoint.row, breakpoint.state))
+                        .sorted_by_key(|(row, _)| *row)
+                        .collect::<Vec<_>>()
+                }),
+            ),
+            (
+                Vec::from([
+                    proto::BreakpointEdit::Superseded,
+                    proto::BreakpointEdit::Set
+                ]),
+                Vec::from([
+                    (0, BreakpointState::Disabled),
+                    (1, BreakpointState::Enabled)
+                ]),
+            )
+        );
+    }
+
+    async fn send_upstream_edit(
+        breakpoint_store: &Entity<BreakpointStore>,
+        breakpoint: &BreakpointWithPosition,
+        edit: proto::BreakpointEdit,
+        cx: &mut TestAppContext,
+    ) -> Result<proto::Ack> {
+        let envelope = TypedEnvelope {
+            sender_id: proto::PeerId { owner_id: 0, id: 0 },
+            original_sender_id: None,
+            message_id: 0,
+            payload: proto::ToggleBreakpoint {
+                project_id: 0,
+                path: String::from(path!("/a/test.txt")),
+                breakpoint: breakpoint.bp.to_proto(
+                    Path::new(path!("/a/test.txt")),
+                    &breakpoint.position,
+                    &HashMap::default(),
+                ),
+                edit: i32::from(edit),
+            },
+            received_at: std::time::Instant::now(),
+        };
+        BreakpointStore::handle_toggle_breakpoint(breakpoint_store.clone(), envelope, cx.to_async())
+            .await
+    }
+
+    async fn toggle_breakpoint_from(
+        breakpoint_store: &Entity<BreakpointStore>,
+        buffer: &Entity<Buffer>,
+        sender: proto::PeerId,
+        cx: &mut TestAppContext,
+    ) -> Result<proto::Ack, String> {
+        let position = buffer.read_with(cx, |buffer, _| buffer.anchor_before(Point::new(1, 0)));
+        let envelope = TypedEnvelope {
+            sender_id: proto::PeerId { owner_id: 0, id: 0 },
+            original_sender_id: Some(sender),
+            message_id: 0,
+            payload: proto::ToggleBreakpoint {
+                project_id: 0,
+                path: String::from(path!("/a/test.txt")),
+                breakpoint: Breakpoint::new_standard().to_proto(
+                    Path::new(path!("/a/test.txt")),
+                    &position,
+                    &HashMap::default(),
+                ),
+                edit: i32::from(proto::BreakpointEdit::Set),
+            },
+            received_at: std::time::Instant::now(),
+        };
+        BreakpointStore::handle_toggle_breakpoint(breakpoint_store.clone(), envelope, cx.to_async())
+            .await
+            .map_err(|error| error.to_string())
     }
 }

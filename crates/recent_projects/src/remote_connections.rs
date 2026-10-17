@@ -6,7 +6,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use editor::Editor;
 use futures::{FutureExt as _, channel::oneshot, future::LocalBoxFuture, select};
-use gpui::{App, AppContext, AsyncApp, Entity, PromptLevel, Task, WindowHandle};
+use gpui::{App, AppContext, AsyncApp, Entity, Global, PromptLevel, Task, WindowHandle};
 
 use project::trusted_worktrees;
 use remote::{
@@ -14,12 +14,14 @@ use remote::{
     SshConnectionOptions, same_remote_connection_target,
 };
 pub use settings::SshConnection;
-use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
+use settings::{
+    DevContainerConnection, ExtendingVec, RegisterSetting, Settings, SettingsStore, WslConnection,
+};
 use util::{ResultExt as _, paths::PathWithPosition};
 use workspace::{
-    AppState, MultiWorkspace, MultiWorkspaceEvent, OpenOptions, RestoredRemoteWorkspace,
-    SerializedWorkspaceLocation, Workspace, WorkspaceDb, WorkspaceMatching,
-    find_existing_workspace,
+    AppState, ConfiguredSshConnection, MultiWorkspace, MultiWorkspaceEvent, OpenOptions,
+    RestoredRemoteWorkspace, SerializedWorkspaceLocation, SshArgumentRenames, Workspace,
+    WorkspaceDb, WorkspaceIdClaims, WorkspaceMatching, find_existing_workspace,
 };
 
 pub use remote_connection::{
@@ -27,7 +29,7 @@ pub use remote_connection::{
     SshConnectionHeader, connect,
 };
 
-#[derive(RegisterSetting)]
+#[derive(Clone, RegisterSetting)]
 pub struct RemoteSettings {
     pub ssh_connections: ExtendingVec<SshConnection>,
     pub wsl_connections: ExtendingVec<WslConnection>,
@@ -45,26 +47,22 @@ impl RemoteSettings {
     }
 
     pub fn fill_connection_options_from_settings(&self, options: &mut SshConnectionOptions) {
-        let host = options.host.to_string();
-        let mut same_host = self
-            .ssh_connections()
-            .filter(|conn| {
-                conn.host == host && conn.username == options.username && conn.port == options.port
-            })
-            .collect::<Vec<_>>();
-        let conn = match options.args.as_deref() {
-            None => same_host.into_iter().next(),
-            Some(args) => match same_host.iter().position(|conn| conn.args == args) {
-                Some(index) => Some(same_host.swap_remove(index)),
-                None if same_host.len() == 1 => same_host.pop(),
-                None => None,
-            },
-        };
-        if let Some(conn) = conn {
+        if let Some(conn) = self.ssh_connection_for(options) {
             options.nickname = conn.nickname;
             options.upload_binary_over_ssh = conn.upload_binary_over_ssh.unwrap_or_default();
             options.args = Some(conn.args);
             options.port_forwards = conn.port_forwards;
+        }
+    }
+
+    fn ssh_connection_for(&self, options: &SshConnectionOptions) -> Option<SshConnection> {
+        let host = options.host.to_string();
+        let mut same_host = self.ssh_connections().filter(|conn| {
+            conn.host == host && conn.username == options.username && conn.port == options.port
+        });
+        match options.args.as_deref() {
+            Some(args) => same_host.find(|conn| conn.args == args),
+            None => same_host.next(),
         }
     }
 
@@ -83,6 +81,56 @@ impl RemoteSettings {
         self.fill_connection_options_from_settings(&mut options);
         options
     }
+}
+
+pub async fn sync_ssh_connections_on_startup(cx: &mut AsyncApp) -> Result<()> {
+    sync_ssh_connections_with_settings(SshArgumentRenames::Discard, cx).await
+}
+
+async fn sync_ssh_connections_with_settings(
+    renames_from_previous_runs: SshArgumentRenames,
+    cx: &mut AsyncApp,
+) -> Result<()> {
+    let (db, configured) =
+        cx.update(|cx| (WorkspaceDb::global(cx), configured_ssh_connections(cx)));
+    db.sync_ssh_connections(configured, renames_from_previous_runs)
+        .await
+}
+
+pub(crate) fn sync_ssh_connections_on_settings_change(cx: &mut App) {
+    let mut synced = configured_ssh_connections(cx);
+    cx.observe_global::<SettingsStore>(move |cx| {
+        let configured = configured_ssh_connections(cx);
+        if configured == synced {
+            return;
+        }
+        synced = configured;
+        let sync = cx.spawn(async move |cx| {
+            sync_ssh_connections_with_settings(SshArgumentRenames::Keep, cx)
+                .await
+                .log_err();
+        });
+        cx.set_global(SshConnectionsSync { _sync: sync });
+    })
+    .detach();
+}
+
+struct SshConnectionsSync {
+    _sync: Task<()>,
+}
+
+impl Global for SshConnectionsSync {}
+
+fn configured_ssh_connections(cx: &App) -> Vec<ConfiguredSshConnection> {
+    RemoteSettings::get_global(cx)
+        .ssh_connections()
+        .map(|connection| ConfiguredSshConnection {
+            host: connection.host,
+            username: connection.username,
+            port: connection.port,
+            args: connection.args,
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq)]
@@ -141,21 +189,17 @@ pub async fn open_remote_project(
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
-    let (window, connected) = open_remote_project_inner(
+    open_remote_project_inner(
         connection_options,
         paths,
         app_state,
         open_options,
         None,
         None,
-        None,
         cx,
     )
-    .await?;
-    if connected {
-        cx.update(|cx| workspace::focus_requested_window(window.into(), cx));
-    }
-    Ok(window)
+    .await
+    .map(|(window, _)| window)
 }
 
 pub fn restore_remote_project(
@@ -183,10 +227,10 @@ pub fn restore_remote_project(
             paths,
             app_state,
             open_options,
-            Some(window_ready),
             Some(connect_after.boxed_local()),
             Some(SessionRestore {
                 restored,
+                window_ready,
                 workspace_created,
                 known_password,
             }),
@@ -199,6 +243,7 @@ pub fn restore_remote_project(
 
 struct SessionRestore {
     restored: RestoredRemoteWorkspace,
+    window_ready: oneshot::Sender<WindowHandle<MultiWorkspace>>,
     workspace_created: oneshot::Sender<()>,
     known_password: KnownPassword,
 }
@@ -208,7 +253,6 @@ async fn open_remote_project_inner(
     paths: Vec<PathBuf>,
     app_state: Arc<AppState>,
     open_options: workspace::OpenOptions,
-    mut window_ready: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     connect_after: Option<LocalBoxFuture<'static, ()>>,
     session_restore: Option<SessionRestore>,
     cx: &mut AsyncApp,
@@ -217,7 +261,9 @@ async fn open_remote_project_inner(
     let (mut existing, mut open_visible) =
         find_existing_workspace(&paths, &open_options, &location, cx).await;
     let mut matched_paths_without_positions = None;
+    let literal_paths = session_restore.is_some();
     if existing.is_none()
+        && !literal_paths
         && let Some(paths_without_positions) = paths_without_positions(&paths)
     {
         (existing, open_visible) =
@@ -237,7 +283,7 @@ async fn open_remote_project_inner(
 
         if let Some(remote_connection) = remote_connection {
             let (resolved_paths, paths_with_positions) =
-                determine_paths_with_positions(&remote_connection, paths.clone()).await;
+                resolve_requested_paths(&remote_connection, paths.clone(), literal_paths).await;
             let reuse_existing = matched_paths_without_positions.is_none_or(|matched_paths| {
                 matched_paths == resolved_paths
                     && same_remote_connection_target(
@@ -251,33 +297,36 @@ async fn open_remote_project_inner(
                     paths,
                     app_state,
                     open_options,
-                    window_ready,
                     connect_after,
                     session_restore,
                     cx,
                 )
                 .await;
             }
-            if let Some(window_ready) = window_ready.take() {
-                window_ready.send(existing_window).ok();
-            }
             if let Some(session_restore) = session_restore {
+                session_restore.window_ready.send(existing_window).ok();
                 session_restore.workspace_created.send(()).ok();
                 let restored = session_restore.restored;
-                let db = cx.update(|cx| WorkspaceDb::global(cx));
-                db.release_restored_workspace(restored.workspace_id, restored.original, None)
-                    .await
-                    .log_err();
+                let (db, claims) =
+                    cx.update(|cx| (WorkspaceDb::global(cx), WorkspaceIdClaims::global(cx)));
+                db.release_restored_workspace(
+                    restored.workspace_id,
+                    restored.original,
+                    None,
+                    claims,
+                )
+                .await
+                .log_err();
             }
-            let restoration = cx.update(|cx| existing_workspace.read(cx).pending_restoration());
-            if let Some(restoration) = restoration {
-                workspace::wait_for_restoration(existing_window, restoration, cx).await?;
+            let restoring =
+                cx.update(|cx| existing_workspace.read(cx).pending_restoration().is_some());
+            if restoring {
+                workspace::wait_for_restoration(existing_window, &existing_workspace, cx).await?;
                 return Box::pin(open_remote_project_inner(
                     connection_options,
                     paths,
                     app_state,
                     open_options,
-                    None,
                     connect_after,
                     None,
                     cx,
@@ -334,7 +383,6 @@ async fn open_remote_project_inner(
         paths,
         app_state,
         open_options,
-        window_ready,
         connect_after,
         session_restore,
         cx,
@@ -346,19 +394,15 @@ fn paths_without_positions(paths: &[PathBuf]) -> Option<Vec<PathBuf>> {
     let mut has_position = false;
     let paths = paths
         .iter()
-        .map(|path| {
-            match path
-                .to_str()
-                .map(PathWithPosition::parse_str)
-                .filter(|parsed_path| parsed_path.row.is_some())
-            {
-                Some(parsed_path) => {
+        .map(
+            |path| match path.to_str().map(PathWithPosition::parse_str) {
+                Some(parsed_path) if parsed_path.row.is_some() => {
                     has_position = true;
                     parsed_path.path
                 }
-                None => path.clone(),
-            }
-        })
+                _ => path.clone(),
+            },
+        )
         .collect::<Vec<_>>();
     has_position.then_some(paths)
 }
@@ -368,27 +412,28 @@ async fn open_remote_project_in_new_connection(
     paths: Vec<PathBuf>,
     app_state: Arc<AppState>,
     open_options: workspace::OpenOptions,
-    window_ready: Option<oneshot::Sender<WindowHandle<MultiWorkspace>>>,
     mut connect_after: Option<LocalBoxFuture<'static, ()>>,
     session_restore: Option<SessionRestore>,
     cx: &mut AsyncApp,
 ) -> Result<(WindowHandle<MultiWorkspace>, bool)> {
     let restoring_session = session_restore.is_some();
-    let (restored, workspace_created, known_password) = match session_restore {
-        Some(SessionRestore {
-            restored,
-            workspace_created,
-            known_password,
-        }) => (Some(restored), Some(workspace_created), known_password),
+    let (restored, window_ready, workspace_created, known_password) = match session_restore {
+        Some(restore) => (
+            Some(restore.restored),
+            Some(restore.window_ready),
+            Some(restore.workspace_created),
+            restore.known_password,
+        ),
         None => (
+            None,
             None,
             None,
             KnownPassword::for_connection(&connection_options),
         ),
     };
     let restored_workspace_id = restored.as_ref().map(|restored| restored.workspace_id);
+    let restored_state = restored.as_ref().map(|restored| restored.state.clone());
     let created_new_window = open_options.requesting_window.is_none();
-    let activate_window = window_ready.is_none();
     let (window, initial_workspace) = if let Some(window) = open_options.requesting_window {
         let workspace = window.update(cx, |multi_workspace, _, _| {
             multi_workspace.workspace().clone()
@@ -397,7 +442,12 @@ async fn open_remote_project_in_new_connection(
     } else {
         let workspace_position = cx
             .update(|cx| {
-                workspace::remote_workspace_position_from_db(connection_options.clone(), &paths, cx)
+                workspace::remote_workspace_position_from_db(
+                    connection_options.clone(),
+                    &paths,
+                    restored_workspace_id,
+                    cx,
+                )
             })
             .await
             .context("fetching remote workspace position from db")?;
@@ -433,11 +483,20 @@ async fn open_remote_project_in_new_connection(
                 }
                 workspace
             });
-            cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+            cx.new(|cx| {
+                let mut multi_workspace = MultiWorkspace::new(workspace, window, cx);
+                if let Some(restored_state) = restored_state {
+                    multi_workspace.begin_restoring_state(restored_state);
+                }
+                multi_workspace
+            })
         })?;
         let workspace = window.update(cx, |multi_workspace, _, _cx| {
             multi_workspace.workspace().clone()
         })?;
+        if let Some(workspace_id) = restored_workspace_id {
+            workspace::restore_native_window_state(window, workspace_id, cx);
+        }
         (window, workspace)
     };
     if let Some(window_ready) = window_ready {
@@ -445,22 +504,18 @@ async fn open_remote_project_in_new_connection(
     }
     let _notify_workspace_created = workspace_created
         .map(|workspace_created| {
-            let multi_workspace = window.entity(cx)?;
             let initial_workspace = initial_workspace.clone();
             let mut workspace_created = Some(workspace_created);
-            anyhow::Ok(cx.update(|cx| {
-                cx.subscribe(
-                    &multi_workspace,
-                    move |multi_workspace, event: &MultiWorkspaceEvent, cx| {
-                        if let MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event
-                            && multi_workspace.read(cx).workspace() != &initial_workspace
-                            && let Some(workspace_created) = workspace_created.take()
-                        {
-                            workspace_created.send(()).ok();
-                        }
-                    },
-                )
-            }))
+            window.update(cx, |_, _, cx| {
+                cx.subscribe_self(move |multi_workspace, event: &MultiWorkspaceEvent, _| {
+                    if let MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } = event
+                        && multi_workspace.workspace() != &initial_workspace
+                        && let Some(workspace_created) = workspace_created.take()
+                    {
+                        workspace_created.send(()).ok();
+                    }
+                })
+            })
         })
         .transpose()?;
 
@@ -473,7 +528,7 @@ async fn open_remote_project_in_new_connection(
             let initial_workspace = initial_workspace.clone();
             let known_password = known_password.clone();
             move |_multi_workspace: &mut MultiWorkspace, window, cx| {
-                if activate_window {
+                if !restoring_session {
                     window.activate_window();
                 }
                 initial_workspace.update(cx, |workspace, cx| {
@@ -524,12 +579,9 @@ async fn open_remote_project_in_new_connection(
                 _ = cancel_rx => true,
                 _ = connect_after.fuse() => false,
             };
-            if cancelled {
+            if cancelled || window.update(cx, |_, _, _| ()).is_err() {
                 finish_connection_modal(&initial_workspace, cx);
                 break;
-            }
-            if window.update(cx, |_, _, _| ()).is_err() {
-                return Ok((window, false));
             }
             remote::RemoteClientDelegate::set_status(delegate.as_ref(), None, cx);
         }
@@ -586,7 +638,7 @@ async fn open_remote_project_in_new_connection(
         };
 
         let (paths, paths_with_positions) =
-            determine_paths_with_positions(&remote_connection, paths.clone()).await;
+            resolve_requested_paths(&remote_connection, paths.clone(), restoring_session).await;
 
         let opened = cx
             .update(|cx| {
@@ -662,16 +714,14 @@ async fn open_remote_project_in_new_connection(
     }
 
     if connected {
-        initial_workspace.update(cx, |workspace, _| {
-            workspace.forget_placeholder_session();
-        });
+        initial_workspace.update(cx, |workspace, _| workspace.forget_placeholder_session());
     } else {
         release_placeholder_session_workspace(window, &initial_workspace, cx).await;
-    }
-    if created_new_window && !connected {
-        initial_workspace.update(cx, |workspace, _| {
-            workspace.set_remote_connection_placeholder(false);
-        });
+        if created_new_window {
+            initial_workspace.update(cx, |workspace, _| {
+                workspace.set_remote_connection_placeholder(false)
+            });
+        }
     }
 
     Ok((window, connected))
@@ -721,6 +771,23 @@ pub fn navigate_to_positions(
                 })
                 .ok();
         }
+    }
+}
+
+async fn resolve_requested_paths(
+    remote_connection: &Arc<dyn RemoteConnection>,
+    paths: Vec<PathBuf>,
+    literal_paths: bool,
+) -> (Vec<PathBuf>, Vec<PathWithPosition>) {
+    if literal_paths {
+        let paths_with_positions = paths
+            .iter()
+            .cloned()
+            .map(PathWithPosition::from_path)
+            .collect();
+        (paths, paths_with_positions)
+    } else {
+        determine_paths_with_positions(remote_connection, paths).await
     }
 }
 
@@ -778,13 +845,13 @@ fn finish_connection_modal(workspace: &Entity<Workspace>, cx: &mut AsyncApp) {
 mod tests {
     use super::*;
     use extension::ExtensionHostProxy;
-    use fs::FakeFs;
+    use fs::{FakeFs, Fs as _};
     use futures::future;
     use gpui::{AppContext, Empty, Entity, TestAppContext};
     use http_client::BlockedHttpClient;
     use node_runtime::NodeRuntime;
     use project::Project;
-    use remote::RemoteClient;
+    use remote::{MockDelegate, RemoteClient};
     use remote_server::{HeadlessAppState, HeadlessProject};
     use rpc::proto;
     use serde_json::json;
@@ -795,37 +862,54 @@ mod tests {
     };
 
     #[test]
-    fn test_fill_connection_options_keeps_the_saved_ssh_target() {
-        let target_args = |target: &str| vec!["-o".to_string(), format!("Hostname={target}")];
-        let entry = |target: &str| SshConnection {
+    fn test_fill_connection_options_never_replaces_saved_ssh_arguments() {
+        let args = |args: &str| args.split(',').map(String::from).collect::<Vec<_>>();
+        let entry = |nickname: &str, entry_args: &str| SshConnection {
             host: "host".to_string(),
-            args: target_args(target),
-            nickname: Some(target.to_string()),
+            args: args(entry_args),
+            nickname: Some(nickname.to_string()),
             ..SshConnection::default()
         };
         let settings = RemoteSettings {
-            ssh_connections: ExtendingVec::from(vec![entry("host-a"), entry("host-b")]),
+            ssh_connections: ExtendingVec::from(vec![
+                entry("a", "-oHostName=a,-i,/a"),
+                entry("b", "-oHostName=a,-i,/b"),
+                entry("j", "-oHostName=b,-J,j,-i,/y"),
+            ]),
             wsl_connections: ExtendingVec::from(Vec::new()),
             read_ssh_config: false,
         };
-        let filled_nickname = |args: Option<Vec<String>>| {
-            let mut options = SshConnectionOptions {
-                host: "host".into(),
-                args,
-                ..SshConnectionOptions::default()
-            };
-            settings.fill_connection_options_from_settings(&mut options);
-            options.nickname
-        };
+        let cases = [
+            (None, Some("a"), "-oHostName=a,-i,/a"),
+            (Some("-oHostName=a,-i,/b"), Some("b"), "-oHostName=a,-i,/b"),
+            (Some("-oHostName=a,-i,/x"), None, "-oHostName=a,-i,/x"),
+            (
+                Some("-J,j,-oHostName=b,-i,/y"),
+                None,
+                "-J,j,-oHostName=b,-i,/y",
+            ),
+            (Some("-oHostName=c"), None, "-oHostName=c"),
+            (
+                Some("-oHostName=b,-J,j,-i,/y"),
+                Some("j"),
+                "-oHostName=b,-J,j,-i,/y",
+            ),
+        ];
 
-        assert_eq!(
-            [
-                filled_nickname(None),
-                filled_nickname(Some(target_args("host-b"))),
-                filled_nickname(Some(target_args("removed"))),
-            ],
-            [Some("host-a".to_string()), Some("host-b".to_string()), None]
-        );
+        let mismatches = cases
+            .into_iter()
+            .filter(|(saved_args, nickname, filled_args)| {
+                let mut options = SshConnectionOptions {
+                    host: "host".into(),
+                    args: saved_args.map(args),
+                    ..SshConnectionOptions::default()
+                };
+                settings.fill_connection_options_from_settings(&mut options);
+                (options.nickname, options.args)
+                    != (nickname.map(String::from), Some(args(filled_args)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mismatches, Vec::new());
     }
 
     #[gpui::test]
@@ -1133,20 +1217,20 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_restore_reports_workspace_before_items_finish_loading(
+    async fn test_restore_rootless_remote_workspace_reports_it_before_items_load(
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) {
         let app_state = init_test(cx);
         cx.update(workspace::register_serializable_item::<TestItem>);
-        let project_path = paths::home_dir().join("remote-pending-items");
+        let project_path = paths::home_dir().join("remote-rootless-project");
         let (opts, _headless) =
             start_headless_server(&project_path, json!({ "notes.txt": "" }), cx, server_cx).await;
 
         let mut async_cx = cx.to_async();
         let window = open_remote_project(
             opts.clone(),
-            vec![project_path.clone()],
+            vec![project_path],
             app_state.clone(),
             workspace::OpenOptions::default(),
             &mut async_cx,
@@ -1154,11 +1238,30 @@ mod tests {
         .await
         .unwrap();
         cx.run_until_parked();
+        let workspace_id = window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    let project = workspace.project().clone();
+                    let worktree_ids = project
+                        .read(cx)
+                        .worktrees(cx)
+                        .map(|worktree| worktree.read(cx).id())
+                        .collect::<Vec<_>>();
+                    project.update(cx, |project, cx| {
+                        for worktree_id in worktree_ids {
+                            project.remove_worktree(worktree_id, cx);
+                        }
+                    });
+                    let item = Box::new(cx.new(TestItem::new));
+                    workspace.add_item_to_active_pane(item, None, true, window, cx);
+                    workspace.database_id().unwrap()
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
         window
             .update(cx, |multi_workspace, window, cx| {
                 multi_workspace.workspace().update(cx, |workspace, cx| {
-                    let item = Box::new(cx.new(TestItem::new));
-                    workspace.add_item_to_active_pane(item, None, true, window, cx);
                     workspace.flush_serialization(window, cx)
                 })
             })
@@ -1179,11 +1282,14 @@ mod tests {
         let (window_ready, restore) = cx.update(|cx| {
             restore_remote_project(
                 opts,
-                vec![project_path],
+                Vec::new(),
                 app_state,
                 false,
                 future::ready(()),
-                unbound_restoration(),
+                RestoredRemoteWorkspace {
+                    workspace_id,
+                    ..unbound_restoration()
+                },
                 workspace_created,
                 KnownPassword::default(),
                 cx,
@@ -1203,11 +1309,131 @@ mod tests {
         let created_while_restoring = workspace_created_rx.try_recv();
 
         drop(unblock_deserialization);
-        let (_, connected) = restore.await.unwrap();
+        cx.run_until_parked();
+        let (restored_window, connected) = restore
+            .now_or_never()
+            .expect("restoration must finish without prompting")
+            .unwrap();
+        let restored = restored_window
+            .read_with(cx, |multi_workspace, cx| {
+                let workspace = multi_workspace.workspace().read(cx);
+                (
+                    workspace.database_id(),
+                    workspace.root_paths(cx).len(),
+                    workspace.items_of_type::<TestItem>(cx).count(),
+                )
+            })
+            .unwrap();
         assert_eq!(
-            (restoring, created_while_restoring, connected),
-            (true, Ok(Some(())), true)
+            (restoring, created_while_restoring, connected, restored),
+            (true, Ok(Some(())), true, (Some(workspace_id), 0, 1))
         );
+    }
+
+    #[gpui::test]
+    async fn test_partially_unavailable_remote_roots_survive_restoration(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let live = PathBuf::from(path!("/live/project"));
+        let away = PathBuf::from(path!("/away/project"));
+        let (opts, headless, remote_fs) =
+            start_headless_server_with_fs(&live, json!({}), cx, server_cx).await;
+        remote_fs.insert_tree(&away, json!({})).await;
+        let paths = vec![live, away.clone()];
+
+        let mut async_cx = cx.to_async();
+        let window = open_remote_project(
+            opts.clone(),
+            paths.clone(),
+            app_state.clone(),
+            workspace::OpenOptions::default(),
+            &mut async_cx,
+        )
+        .await
+        .unwrap();
+        cx.run_until_parked();
+        let workspace_id = window
+            .read_with(cx, |multi_workspace, cx| {
+                multi_workspace.workspace().read(cx).database_id().unwrap()
+            })
+            .unwrap();
+        close_after_flushing(window, cx).await;
+        remote_fs
+            .remove_dir(
+                Path::new(path!("/away")),
+                fs::RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let saved_paths = async |cx: &mut TestAppContext| {
+            let (db, session_id) = cx.update(|cx| {
+                (
+                    WorkspaceDb::global(cx),
+                    app_state.session.read(cx).id().to_owned(),
+                )
+            });
+            workspace::last_session_workspace_locations(
+                &db,
+                &session_id,
+                None,
+                app_state.fs.as_ref(),
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|location| location.workspace_id == workspace_id)
+            .map(|location| location.paths.paths().len())
+            .collect::<Vec<_>>()
+        };
+        let mut restored_root_counts = Vec::new();
+        for _ in 0..2 {
+            headless.update(server_cx, |headless, cx| {
+                headless.worktree_store.update(cx, |worktree_store, cx| {
+                    let worktree_ids = worktree_store
+                        .worktrees()
+                        .map(|worktree| worktree.read(cx).id())
+                        .collect::<Vec<_>>();
+                    for worktree_id in worktree_ids {
+                        worktree_store.remove_worktree(worktree_id, cx);
+                    }
+                })
+            });
+            server_cx.run_until_parked();
+            let (_, restore) = cx.update(|cx| {
+                restore_remote_project(
+                    opts.clone(),
+                    paths.clone(),
+                    app_state.clone(),
+                    false,
+                    future::ready(()),
+                    RestoredRemoteWorkspace {
+                        workspace_id,
+                        ..unbound_restoration()
+                    },
+                    oneshot::channel().0,
+                    KnownPassword::default(),
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            let (window, _) = restore.await.unwrap();
+            let live_roots = window
+                .read_with(cx, |multi_workspace, cx| {
+                    multi_workspace.workspace().read(cx).root_paths(cx).len()
+                })
+                .unwrap();
+            close_after_flushing(window, cx).await;
+            restored_root_counts.push((live_roots, saved_paths(cx).await));
+            remote_fs.insert_tree(&away, json!({})).await;
+        }
+
+        assert_eq!(restored_root_counts, vec![(1, vec![2]), (2, vec![2])]);
     }
 
     #[gpui::test]
@@ -1373,15 +1599,13 @@ mod tests {
         let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
 
         let remote_fs = FakeFs::new(server_cx.executor());
+        let project_tree = json!({
+            "src": {
+                "main.rs": "fn main() {}",
+            },
+        });
         remote_fs
-            .insert_tree(
-                path!("/project"),
-                json!({
-                    "src": {
-                        "main.rs": "fn main() {}",
-                    },
-                }),
-            )
+            .insert_tree(path!("/workspace/project"), project_tree.clone())
             .await;
 
         server_cx.update(HeadlessProject::init);
@@ -1409,7 +1633,7 @@ mod tests {
         drop(connect_guard);
 
         // Open the remote project normally.
-        let paths = vec![PathBuf::from(path!("/project"))];
+        let paths = vec![PathBuf::from(path!("/workspace/project"))];
         let mut async_cx = cx.to_async();
         open_remote_project(
             opts.clone(),
@@ -1488,6 +1712,70 @@ mod tests {
             .unwrap();
         executor.run_until_parked();
 
+        let remote_connection =
+            remote::connect(opts.clone(), Arc::new(MockDelegate), &mut async_cx)
+                .await
+                .unwrap();
+        let (cancel, cancelled) = oneshot::channel();
+        cancel.send(()).unwrap();
+        let (cancelled_workspace, _) = cx
+            .update(|cx| {
+                workspace::open_remote_project_with_new_connection(
+                    window,
+                    remote_connection.clone(),
+                    cancelled,
+                    Arc::new(MockDelegate),
+                    app_state.clone(),
+                    paths.clone(),
+                    false,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        executor.run_until_parked();
+        let after_cancelled_reconnect = (
+            cancelled_workspace.is_none(),
+            disconnected_workspace.read_with(cx, |workspace, _| workspace.database_id()),
+        );
+
+        remote_fs
+            .remove_dir(
+                Path::new(path!("/workspace")),
+                fs::RemoveOptions {
+                    recursive: true,
+                    ignore_if_not_exists: false,
+                },
+            )
+            .await
+            .unwrap();
+        let (_keep_connecting, connecting) = oneshot::channel();
+        let failed_reconnect = cx
+            .update(|cx| {
+                workspace::open_remote_project_with_new_connection(
+                    window,
+                    remote_connection.clone(),
+                    connecting,
+                    Arc::new(MockDelegate),
+                    app_state.clone(),
+                    paths.clone(),
+                    false,
+                    None,
+                    cx,
+                )
+            })
+            .await;
+        executor.run_until_parked();
+        let after_failed_reconnect = (
+            failed_reconnect.is_err(),
+            disconnected_workspace.read_with(cx, |workspace, _| workspace.database_id()),
+        );
+        remote_fs
+            .insert_tree(path!("/workspace/project"), project_tree)
+            .await;
+        let _pooled_connection = remote_connection;
+
         // Simulate clicking "Reconnect": calls open_remote_project with
         // replace_window pointing to the existing window.
         let result = open_remote_project(
@@ -1524,10 +1812,12 @@ mod tests {
                 });
                 assert_eq!(
                     (
+                        after_cancelled_reconnect,
+                        after_failed_reconnect,
                         workspace != disconnected_workspace,
                         workspace.read(cx).database_id(),
                     ),
-                    (true, database_id)
+                    ((true, database_id), (true, database_id), true, database_id)
                 );
             })
             .unwrap();
@@ -1614,14 +1904,53 @@ mod tests {
         cx: &mut TestAppContext,
         server_cx: &mut TestAppContext,
     ) -> (RemoteConnectionOptions, Entity<HeadlessProject>) {
+        let (opts, headless, _) = start_headless_server_with_fs(root, tree, cx, server_cx).await;
+        (opts, headless)
+    }
+
+    async fn close_after_flushing(window: WindowHandle<MultiWorkspace>, cx: &mut TestAppContext) {
+        window
+            .update(cx, |multi_workspace, window, cx| {
+                multi_workspace.workspace().update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .unwrap()
+            .await;
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .unwrap();
+        cx.run_until_parked();
+    }
+
+    async fn start_headless_server_with_fs(
+        root: &Path,
+        tree: serde_json::Value,
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (
+        RemoteConnectionOptions,
+        Entity<HeadlessProject>,
+        Arc<FakeFs>,
+    ) {
         cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
         server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
         let (opts, session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
         let fs = FakeFs::new(server_cx.executor());
         fs.insert_tree(root, tree).await;
         server_cx.update(HeadlessProject::init);
+        let headless = serve_headless_project(session, fs.clone(), server_cx);
+        drop(connect_guard);
+        (opts, headless, fs)
+    }
+
+    fn serve_headless_project(
+        session: rpc::AnyProtoClient,
+        fs: Arc<FakeFs>,
+        server_cx: &mut TestAppContext,
+    ) -> Entity<HeadlessProject> {
         let languages = Arc::new(language::LanguageRegistry::new(server_cx.executor()));
-        let headless = server_cx.new(|cx| {
+        server_cx.new(|cx| {
             HeadlessProject::new(
                 HeadlessAppState {
                     session,
@@ -1635,8 +1964,6 @@ mod tests {
                 false,
                 cx,
             )
-        });
-        drop(connect_guard);
-        (opts, headless)
+        })
     }
 }

@@ -7,8 +7,9 @@ use ui::{App, Context};
 use util::{ResultExt, paths::PathExt};
 
 use crate::{
-    NewWindow, SerializedWorkspaceLocation, WorkspaceId, path_list::PathList,
-    persistence::WorkspaceDb,
+    NewWindow, SerializedWorkspaceLocation, WorkspaceId,
+    path_list::PathList,
+    persistence::{WorkspaceDb, WorkspaceIdClaims},
 };
 
 pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
@@ -108,6 +109,7 @@ impl HistoryManager {
             .collect::<Vec<_>>();
         let user_removed = cx.update_jump_list(menus, entries);
         let db = WorkspaceDb::global(cx);
+        let claims = WorkspaceIdClaims::global(cx);
         cx.spawn(async move |this, cx| {
             let user_removed = user_removed.await;
             if user_removed.is_empty() {
@@ -124,9 +126,9 @@ impl HistoryManager {
                     }
                 }
             }) {
-                for id in deleted_ids.iter() {
-                    db.delete_workspace_by_id(*id).await.log_err();
-                }
+                db.delete_unclaimed_workspaces(deleted_ids, claims)
+                    .await
+                    .log_err();
             }
         })
         .detach();

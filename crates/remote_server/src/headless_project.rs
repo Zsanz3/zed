@@ -1535,3 +1535,188 @@ fn find_venv_python(working_directory: &str) -> Option<std::path::PathBuf> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use client::{Client, UserStore};
+    use clock::FakeSystemClock;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use http_client::{BlockedHttpClient, FakeHttpClient};
+    use language::DiskState;
+    use project::Project;
+    use remote::RemoteClient;
+    use serde_json::json;
+    use settings::SettingsStore;
+    use std::time::Duration;
+    use util::{path, rel_path::rel_path};
+
+    #[gpui::test]
+    async fn test_deleted_files_agree_between_client_and_server(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let fs = FakeFs::new(server_cx.executor());
+        fs.insert_tree(
+            path!("/code"),
+            json!({ "project": { "live.txt": "live" }, "other": {} }),
+        )
+        .await;
+        let (project, headless) = init_test(&fs, cx, server_cx).await;
+        let mut client_buffers = Vec::new();
+        for (root, file_name) in [
+            (path!("/code/project"), "live.txt"),
+            (path!("/code/other"), "missing.txt"),
+        ] {
+            let (worktree, _) = project
+                .update(cx, |project, cx| {
+                    project.find_or_create_worktree(root, true, cx)
+                })
+                .await
+                .unwrap();
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            client_buffers.push(
+                project
+                    .update(cx, |project, cx| {
+                        project.open_buffer((worktree_id, rel_path(file_name)), cx)
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+        run_until_parked(cx, server_cx);
+        let opened_states = disk_states(&headless, &client_buffers, cx, server_cx);
+
+        project.update(cx, |project, cx| {
+            project.buffer_store().update(cx, |buffer_store, cx| {
+                buffer_store.mark_file_deleted(&client_buffers[1], cx)
+            })
+        });
+        fs.remove_dir(
+            Path::new(path!("/code/project")),
+            fs::RemoveOptions {
+                recursive: true,
+                ignore_if_not_exists: false,
+            },
+        )
+        .await
+        .unwrap();
+        run_until_parked(cx, server_cx);
+        server_cx.executor().advance_clock(Duration::from_secs(1));
+        run_until_parked(cx, server_cx);
+
+        assert_eq!(
+            (
+                opened_states,
+                disk_states(&headless, &client_buffers, cx, server_cx)
+            ),
+            (
+                vec![("present", "present"), ("new", "new")],
+                vec![("deleted", "deleted"), ("deleted", "deleted")],
+            )
+        );
+    }
+
+    fn run_until_parked(cx: &mut TestAppContext, server_cx: &mut TestAppContext) {
+        cx.run_until_parked();
+        server_cx.run_until_parked();
+        cx.run_until_parked();
+    }
+
+    fn disk_states(
+        headless: &Entity<HeadlessProject>,
+        client_buffers: &[Entity<Buffer>],
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> Vec<(&'static str, &'static str)> {
+        client_buffers
+            .iter()
+            .map(|client_buffer| {
+                let (buffer_id, client_state) = client_buffer.read_with(cx, |buffer, _| {
+                    (buffer.remote_id(), disk_state_name(buffer))
+                });
+                let server_state = headless.read_with(server_cx, |headless, cx| {
+                    headless
+                        .buffer_store
+                        .read(cx)
+                        .get(buffer_id)
+                        .map_or("missing", |buffer| disk_state_name(buffer.read(cx)))
+                });
+                (client_state, server_state)
+            })
+            .collect()
+    }
+
+    fn disk_state_name(buffer: &Buffer) -> &'static str {
+        match buffer.file().map(|file| file.disk_state()) {
+            Some(DiskState::Present { .. }) => "present",
+            Some(DiskState::Deleted) => "deleted",
+            Some(DiskState::New) => "new",
+            Some(DiskState::Historic { .. }) => "historic",
+            None => "none",
+        }
+    }
+
+    async fn init_test(
+        server_fs: &Arc<FakeFs>,
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<HeadlessProject>) {
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        let (opts, session, _) = RemoteClient::fake_server(cx, server_cx);
+        server_cx.update(HeadlessProject::init);
+        let languages = Arc::new(LanguageRegistry::new(cx.executor()));
+        let headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session,
+                    fs: server_fs.clone(),
+                    http_client: Arc::new(BlockedHttpClient),
+                    node_runtime: NodeRuntime::unavailable(),
+                    languages,
+                    extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                    startup_time: Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+        let remote_client = RemoteClient::connect_mock(opts, cx).await;
+        cx.update(|cx| {
+            if !cx.has_global::<SettingsStore>() {
+                let settings_store = SettingsStore::test(cx);
+                cx.set_global(settings_store);
+            }
+        });
+        let client = cx.update(|cx| {
+            Client::new(
+                Arc::new(FakeSystemClock::new()),
+                FakeHttpClient::with_404_response(),
+                cx,
+            )
+        });
+        let user_store = cx.new(|cx| UserStore::new(client.clone(), cx));
+        cx.update(|cx| Project::init(&client, cx));
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                client,
+                NodeRuntime::unavailable(),
+                user_store,
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone())),
+                FakeFs::new(cx.background_executor().clone()),
+                false,
+                cx,
+            )
+        });
+        project
+            .update(cx, {
+                let headless = headless.clone();
+                |_, cx| cx.on_release(|_, _| drop(headless))
+            })
+            .detach();
+        (project, headless)
+    }
+}

@@ -39,16 +39,7 @@ impl Session {
         .await
         .log_err();
 
-        let old_window_stack =
-            stored_window_stack(&db, old_session_id.as_deref()).map(|(session_id, window_ids)| {
-                (
-                    session_id,
-                    window_ids
-                        .into_iter()
-                        .map(WindowId::from)
-                        .collect::<Vec<_>>(),
-                )
-            });
+        let old_window_stack = stored_window_stack(&db, old_session_id.as_deref());
 
         Self {
             session_id,
@@ -193,36 +184,30 @@ fn stored_restorable_session_ids(db: &KeyValueStore, old_session_id: Option<&str
     let Some(old_session_id) = old_session_id else {
         return Vec::new();
     };
-    let stored = db
-        .read_kvp(RESTORABLE_SESSION_IDS_KEY)
+    db.read_kvp(RESTORABLE_SESSION_IDS_KEY)
         .ok()
         .flatten()
         .and_then(|json| serde_json::from_str::<Vec<String>>(&json).ok())
-        .unwrap_or_default();
-    if !stored.iter().any(|session_id| session_id == old_session_id) {
-        return vec![old_session_id.to_owned()];
-    }
-    std::iter::once(old_session_id.to_owned())
-        .chain(
-            stored
-                .into_iter()
-                .filter(|session_id| session_id != old_session_id),
-        )
-        .collect()
+        .filter(|stored| stored.first().is_some_and(|first| first == old_session_id))
+        .unwrap_or_else(|| vec![old_session_id.to_owned()])
 }
 
 fn stored_window_stack(
     db: &KeyValueStore,
     legacy_session_id: Option<&str>,
-) -> Option<(String, Vec<u64>)> {
+) -> Option<(String, Vec<WindowId>)> {
     let json = db.read_kvp(SESSION_WINDOW_STACK_KEY).ok().flatten()?;
-    match serde_json::from_str::<(String, Vec<u64>)>(&json) {
-        Ok(window_stack) => Some(window_stack),
-        Err(_) => Some((
+    let (session_id, window_ids) = match serde_json::from_str::<(String, Vec<u64>)>(&json) {
+        Ok(window_stack) => window_stack,
+        Err(_) => (
             legacy_session_id?.to_owned(),
             serde_json::from_str::<Vec<u64>>(&json).ok()?,
-        )),
-    }
+        ),
+    };
+    Some((
+        session_id,
+        window_ids.into_iter().map(WindowId::from).collect(),
+    ))
 }
 
 async fn store_window_stack(db: KeyValueStore, session_id: &str, windows: &[u64]) {
@@ -256,12 +241,7 @@ mod tests {
 
             let mut window_stacks = Vec::new();
             for (stack_session_id, next_session_id) in [("other", "sixth"), ("sixth", "seventh")] {
-                store_window_stack(
-                    db.clone(),
-                    stack_session_id,
-                    &[WindowId::from(7u64).as_u64()],
-                )
-                .await;
+                store_window_stack(db.clone(), stack_session_id, &[7]).await;
                 window_stacks.push(
                     Session::new(next_session_id.to_owned(), db.clone())
                         .await

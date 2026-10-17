@@ -2,7 +2,10 @@ use crate::{
     RemoteArch, RemoteClientDelegate, RemoteOs, RemotePlatform,
     command::{RemoteCommand, home_relative_path, home_stdio_launcher_command},
     remote_client::{CommandTemplate, Interactive, RemoteConnection, RemoteConnectionOptions},
-    transport::{HOME_DIR_ARGS, HOME_DIR_PROGRAM, parse_home_dir, parse_platform, parse_shell},
+    transport::{
+        HOME_DIR_ARGS, HOME_DIR_PROGRAM, ProxyProcesses, parse_home_dir, parse_platform,
+        parse_shell,
+    },
 };
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
@@ -14,7 +17,6 @@ use futures::{
 };
 use gpui::{App, AppContext as _, AsyncApp, Task};
 use parking_lot::Mutex;
-use paths::remote_server_dir_relative;
 use release_channel::{AppVersion, ReleaseChannel};
 use rpc::proto::Envelope;
 use semver::Version;
@@ -24,15 +26,13 @@ use std::{
     fmt::Write as _,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
 use util::command::{Child, Stdio};
 use util::{
+    ResultExt as _,
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
     shell::ShellKind,
@@ -44,9 +44,7 @@ const SSH_CONNECTION_PROMPT_TIMEOUT: Duration = Duration::from_secs(17);
 pub(crate) struct SshRemoteConnection {
     socket: SshSocket,
     master_process: Mutex<Option<MasterProcess>>,
-    /// Whether `kill()` has been called. Separate from `master_process` because
-    /// reused ControlMaster sessions start with `master_process` as `None`.
-    killed: AtomicBool,
+    proxies: ProxyProcesses,
     remote_binary_path: Option<Arc<RelPath>>,
     ssh_platform: RemotePlatform,
     ssh_os_version: Option<String>,
@@ -423,7 +421,7 @@ impl AsMut<Child> for MasterProcess {
 #[async_trait(?Send)]
 impl RemoteConnection for SshRemoteConnection {
     async fn kill(&self) -> Result<()> {
-        self.killed.store(true, Ordering::Release);
+        self.proxies.kill();
         let Some(mut process) = self.master_process.lock().take() else {
             log::debug!("no master process to kill (external ControlMaster session)");
             return Ok(());
@@ -434,7 +432,7 @@ impl RemoteConnection for SshRemoteConnection {
     }
 
     fn has_been_killed(&self) -> bool {
-        self.killed.load(Ordering::Acquire)
+        self.proxies.has_been_killed()
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
@@ -645,14 +643,7 @@ impl RemoteConnection for SshRemoteConnection {
         let mut ssh_command = if self.ssh_platform.os.is_windows() {
             // TODO: Set the `VARS` environment variables, we do not have `env` on windows
             // so this needs a different approach
-            let mut proxy_args = vec![];
-            proxy_args.push("proxy".to_owned());
-            proxy_args.push("--identifier".to_owned());
-            proxy_args.push(unique_identifier);
-
-            if reconnect {
-                proxy_args.push("--reconnect".to_owned());
-            }
+            let proxy_args = super::proxy_arguments(unique_identifier, reconnect);
             self.socket.ssh_command(
                 self.ssh_shell_kind,
                 &remote_binary_path.display(self.path_style()),
@@ -667,13 +658,7 @@ impl RemoteConnection for SshRemoteConnection {
                 }
             }
             proxy_args.push(remote_binary_path.display(self.path_style()).into_owned());
-            proxy_args.push("proxy".to_owned());
-            proxy_args.push("--identifier".to_owned());
-            proxy_args.push(unique_identifier);
-
-            if reconnect {
-                proxy_args.push("--reconnect".to_owned());
-            }
+            proxy_args.extend(super::proxy_arguments(unique_identifier, reconnect));
             self.socket
                 .ssh_command(self.ssh_shell_kind, "env", &proxy_args, false)
         };
@@ -691,7 +676,7 @@ impl RemoteConnection for SshRemoteConnection {
             }
         };
 
-        super::handle_rpc_messages_over_child_process_stdio(
+        self.proxies.run(
             ssh_proxy_process,
             incoming_tx,
             outgoing_rx,
@@ -989,7 +974,7 @@ impl SshRemoteConnection {
         let mut this = Self {
             socket,
             master_process: Mutex::new(master_process_option),
-            killed: AtomicBool::new(false),
+            proxies: ProxyProcesses::default(),
             _temp_dir: temp_dir,
             remote_binary_path: None,
             ssh_path_style,
@@ -1046,18 +1031,20 @@ impl SshRemoteConnection {
         )
         .await?
         {
-            let tmp_path = paths::remote_server_dir_relative().join(
-                RelPath::from_unix_str(&format!(
-                    "download-{}-{}",
-                    super::staging_file_suffix(),
+            let tmp_path = super::staging_file_path(
+                &binary_name,
+                &format!(
+                    "-{}",
                     remote_server_path.file_name().unwrap().to_string_lossy()
-                ))
-                .unwrap(),
-            );
-            self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
-                .await?;
-            self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
-                .await?;
+                ),
+            )?;
+            let installed = async {
+                self.upload_local_server_binary(&remote_server_path, &tmp_path, delegate, cx)
+                    .await?;
+                self.extract_server_binary(&dst_path, &tmp_path, delegate, cx)
+                    .await
+            };
+            self.install_via_staging(&tmp_path, installed).await?;
             return Ok(dst_path.into());
         }
 
@@ -1076,19 +1063,45 @@ impl SshRemoteConnection {
             _ => Ok(Some(AppVersion::global(cx))),
         })?;
 
-        let tmp_path_compressed = remote_server_dir_relative().join(
-            RelPath::from_unix_str(&format!(
-                "{}-download-{}.{}",
-                binary_name,
-                super::staging_file_suffix(),
-                if self.ssh_platform.os.is_windows() {
-                    "zip"
-                } else {
-                    "gz"
-                }
-            ))
-            .unwrap(),
+        let tmp_path_compressed = super::staging_file_path(
+            &binary_name,
+            if self.ssh_platform.os.is_windows() {
+                ".zip"
+            } else {
+                ".gz"
+            },
+        )?;
+        let installed = self.download_and_extract_server_binary(
+            &dst_path,
+            &tmp_path_compressed,
+            release_channel,
+            wanted_version,
+            delegate,
+            cx,
         );
+        if let Err(error) = self
+            .install_via_staging(&tmp_path_compressed, installed)
+            .await
+        {
+            if !self.server_binary_runs(&dst_path).await {
+                return Err(error);
+            }
+            log::warn!(
+                "failed to install the remote server, using the one installed concurrently: {error:#}"
+            );
+        }
+        Ok(dst_path.into())
+    }
+
+    async fn download_and_extract_server_binary(
+        &self,
+        dst_path: &RelPath,
+        tmp_path_compressed: &RelPath,
+        release_channel: ReleaseChannel,
+        wanted_version: Option<Version>,
+        delegate: &Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
         if !self.socket.connection_options.upload_binary_over_ssh
             && let Some(url) = delegate
                 .get_download_url(
@@ -1104,10 +1117,10 @@ impl SshRemoteConnection {
                 .await
             {
                 Ok(_) => {
-                    self.install_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
+                    self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
                         .await
                         .context("extracting server binary")?;
-                    return Ok(dst_path.into());
+                    return Ok(());
                 }
                 Err(e) => {
                     log::error!(
@@ -1129,10 +1142,56 @@ impl SshRemoteConnection {
         self.upload_local_server_binary(&src_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("uploading server binary")?;
-        self.install_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
+        self.extract_server_binary(&dst_path, &tmp_path_compressed, delegate, cx)
             .await
             .context("extracting server binary")?;
-        Ok(dst_path.into())
+        Ok(())
+    }
+
+    async fn install_via_staging(
+        &self,
+        tmp_path: &RelPath,
+        install: impl Future<Output = Result<()>>,
+    ) -> Result<()> {
+        let installed = install.await;
+        if installed.is_err() {
+            self.remove_staging_files(tmp_path)
+                .await
+                .with_context(|| format!("removing staging files for {tmp_path:?}"))
+                .log_err();
+        }
+        installed
+    }
+
+    async fn remove_staging_files(&self, tmp_path: &RelPath) -> Result<()> {
+        let archive_path = tmp_path.display(self.path_style());
+        let (program, args) = if self.ssh_platform.os.is_windows() {
+            let shell_kind = ShellKind::Pwsh;
+            let paths = [
+                Some(archive_path.as_ref()),
+                archive_path.strip_suffix(".zip"),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|path| shell_kind.try_quote(path).context("shell quoting"))
+            .collect::<Result<Vec<_>>>()?;
+            let script = format!(
+                "Remove-Item -Force -Recurse -ErrorAction SilentlyContinue -LiteralPath {}",
+                paths.join(", ")
+            );
+            ("powershell", shell_kind.args_for_shell(false, script))
+        } else {
+            let args = ["-f", "--", archive_path.as_ref()]
+                .into_iter()
+                .chain(archive_path.strip_suffix(".gz"))
+                .map(String::from)
+                .collect();
+            ("rm", args)
+        };
+        self.socket
+            .run_command(self.ssh_shell_kind, program, &args, true)
+            .await?;
+        Ok(())
     }
 
     async fn server_binary_runs(&self, dst_path: &RelPath) -> bool {
@@ -1145,27 +1204,6 @@ impl SshRemoteConnection {
             )
             .await
             .is_ok()
-    }
-
-    async fn install_server_binary(
-        &self,
-        dst_path: &RelPath,
-        tmp_path: &RelPath,
-        delegate: &Arc<dyn RemoteClientDelegate>,
-        cx: &mut AsyncApp,
-    ) -> Result<()> {
-        let installed = self
-            .extract_server_binary(dst_path, tmp_path, delegate, cx)
-            .await;
-        if let Err(error) = &installed
-            && self.server_binary_runs(dst_path).await
-        {
-            log::warn!(
-                "failed to install the remote server, using the one installed concurrently: {error:#}"
-            );
-            return Ok(());
-        }
-        installed
     }
 
     async fn download_binary_on_server(
@@ -2307,7 +2345,7 @@ mod tests {
                 )]),
             },
             master_process: Mutex::new(None),
-            killed: AtomicBool::new(false),
+            proxies: ProxyProcesses::default(),
             remote_binary_path: None,
             ssh_platform: RemotePlatform {
                 os: RemoteOs::Linux,

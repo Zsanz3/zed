@@ -43,10 +43,10 @@ use std::{
     fmt,
     ops::ControlFlow,
     path::PathBuf,
-    rc::{self, Rc},
+    rc::Rc,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
+        atomic::{AtomicU32, Ordering::SeqCst},
     },
     time::{Duration, Instant},
 };
@@ -331,13 +331,12 @@ impl From<&State> for ConnectionState {
 
 pub struct RemoteClient {
     client: Arc<ChannelClient>,
-    unique_identifier: String,
+    unique_identifier: ServerIdentifierLease,
     connection_options: RemoteConnectionOptions,
     path_style: PathStyle,
     platform: RemotePlatform,
     os_version: Option<String>,
     state: Option<State>,
-    _server_identifier: ServerIdentifierLease,
 }
 
 #[derive(Debug)]
@@ -351,15 +350,28 @@ impl EventEmitter<RemoteClientEvent> for RemoteClient {}
 /// Identifies the socket on the remote server so that reconnects
 /// can re-join the same project.
 pub enum ConnectionIdentifier {
-    Setup(u64),
+    Setup(u32),
     Workspace(i64),
 }
 
-static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+pub fn is_setup_connection_identifier(identifier: &str) -> bool {
+    identifier
+        .split_once(SETUP_IDENTIFIER_MARKER)
+        .is_some_and(|(release_channel, setup_id)| {
+            (release_channel.is_empty()
+                || release_channel
+                    .strip_suffix('-')
+                    .is_some_and(|channel| channel.parse::<ReleaseChannel>().is_ok()))
+                && !setup_id.is_empty()
+                && setup_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+}
+
+const SETUP_IDENTIFIER_MARKER: &str = "conn-";
 
 impl ConnectionIdentifier {
     pub fn setup() -> Self {
-        Self::Setup(NEXT_ID.fetch_add(1, SeqCst))
+        Self::Setup(uuid::Uuid::new_v4().as_u128() as u32)
     }
 
     // This string gets used in a socket name, and so must be relatively short.
@@ -374,10 +386,10 @@ impl ConnectionIdentifier {
             release_channel => format!("{}-", release_channel.dev_name()),
         };
         match self {
-            Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
-            Self::Workspace(workspace_id) => {
-                format!("{identifier_prefix}workspace-{workspace_id}",)
+            Self::Setup(setup_id) => {
+                format!("{identifier_prefix}{SETUP_IDENTIFIER_MARKER}{setup_id:08x}")
             }
+            Self::Workspace(workspace_id) => format!("{identifier_prefix}ws-{workspace_id}"),
         }
     }
 }
@@ -388,7 +400,7 @@ struct LiveServerIdentifiers(Rc<RefCell<HashSet<String>>>);
 impl Global for LiveServerIdentifiers {}
 
 struct ServerIdentifierLease {
-    live: rc::Weak<RefCell<HashSet<String>>>,
+    live: Rc<RefCell<HashSet<String>>>,
     identifier: String,
 }
 
@@ -400,22 +412,13 @@ impl ServerIdentifierLease {
             identifier = ConnectionIdentifier::setup().to_string(cx);
         }
         live.borrow_mut().insert(identifier.clone());
-        Self {
-            live: Rc::downgrade(&live),
-            identifier,
-        }
-    }
-
-    fn identifier(&self) -> &str {
-        &self.identifier
+        Self { live, identifier }
     }
 }
 
 impl Drop for ServerIdentifierLease {
     fn drop(&mut self) {
-        if let Some(live) = self.live.upgrade() {
-            live.borrow_mut().remove(&self.identifier);
-        }
+        self.live.borrow_mut().remove(&self.identifier);
     }
 }
 
@@ -456,12 +459,13 @@ impl RemoteClient {
         cx: &mut App,
     ) -> Task<Result<Option<Entity<Self>>>> {
         let server_identifier = ServerIdentifierLease::acquire(unique_identifier, cx);
-        let unique_identifier = server_identifier.identifier().to_owned();
+        let unique_identifier = server_identifier.identifier.clone();
         cx.spawn(async move |cx| {
             let success = Box::pin(async move {
                 let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<Envelope>();
                 let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
-                let (connection_activity_tx, connection_activity_rx) = mpsc::channel::<()>(1);
+                let (connection_activity_tx, mut connection_activity_rx) =
+                    mpsc::channel::<()>(1);
 
                 let client = cx.update(|cx| {
                     ChannelClient::new(
@@ -480,63 +484,80 @@ impl RemoteClient {
                 let connection_type = connection_options.connection_type();
                 let this = cx.new(|_| Self {
                     client: client.clone(),
-                    unique_identifier: unique_identifier.clone(),
+                    unique_identifier: server_identifier,
                     connection_options,
                     path_style,
                     platform,
                     os_version: os_version.clone(),
                     state: Some(State::Connecting),
-                    _server_identifier: server_identifier,
                 });
 
-                let io_task = remote_connection.start_proxy(
-                    unique_identifier,
-                    false,
-                    incoming_tx,
-                    outgoing_rx,
-                    connection_activity_tx,
-                    delegate.clone(),
-                    cx,
-                );
+                let mut unique_identifier = unique_identifier;
+                let mut proxy_channels = (incoming_tx, outgoing_rx, connection_activity_tx);
+                let io_task = loop {
+                    let (incoming_tx, outgoing_rx, connection_activity_tx) = proxy_channels;
+                    let mut io_task = remote_connection.start_proxy(
+                        unique_identifier.clone(),
+                        false,
+                        incoming_tx,
+                        outgoing_rx,
+                        connection_activity_tx,
+                        delegate.clone(),
+                        cx,
+                    );
 
-                let ready = client
-                    .wait_for_remote_started()
-                    .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor())
-                    .await;
-                match ready {
-                    Ok(Some(_)) => {}
-                    Ok(None) => {
-                        let mut error = "remote client exited before becoming ready".to_owned();
-                        if let Some(status) = io_task.now_or_never() {
-                            match status {
-                                Ok(exit_code) => {
-                                    error.push_str(&format!(", exit_code={exit_code:?}"))
-                                }
-                                Err(e) => error.push_str(&format!(", error={e:?}")),
+                    let ready = client
+                        .wait_for_remote_started()
+                        .with_timeout(INITIAL_CONNECTION_TIMEOUT, cx.background_executor());
+                    let status = select_biased! {
+                        ready = ready.fuse() => match ready {
+                            Ok(Some(_)) => break io_task,
+                            Ok(None) => {
+                                let error = anyhow!("remote client exited before becoming ready");
+                                log::error!("failed to establish connection: {error}");
+                                return Err(error);
                             }
-                        }
-                        let error = anyhow::anyhow!("{error}");
-                        log::error!("failed to establish connection: {}", error);
-                        return Err(error);
-                    }
-                    Err(_) => {
-                        let mut error = String::new();
-                        if let Some(status) = io_task.now_or_never() {
-                            error.push_str("Client exited with ");
-                            match status {
-                                Ok(exit_code) => {
-                                    error.push_str(&format!("exit_code {exit_code:?}"))
-                                }
-                                Err(e) => error.push_str(&format!("error {e:?}")),
+                            Err(_) => {
+                                let error =
+                                    anyhow!("client did not become ready within the timeout");
+                                log::error!("failed to establish connection: {error}");
+                                return Err(error);
                             }
-                        } else {
-                            error.push_str("client did not become ready within the timeout");
-                        }
-                        let error = anyhow::anyhow!("{error}");
-                        log::error!("failed to establish connection: {error}");
-                        return Err(error);
+                        },
+                        status = (&mut io_task).fuse() => status,
+                    };
+
+                    if let Ok(exit_code) = status
+                        && ProxyLaunchError::from_exit_code(exit_code)
+                            == Some(ProxyLaunchError::ServerOwnedByAnotherClient)
+                    {
+                        log::warn!(
+                            "server identifier {unique_identifier} is used by another client, retrying with a new one"
+                        );
+                        unique_identifier = this.update(cx, |this, cx| {
+                            this.unique_identifier =
+                                ServerIdentifierLease::acquire(ConnectionIdentifier::setup(), cx);
+                            this.unique_identifier.identifier.clone()
+                        });
+                        let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<Envelope>();
+                        let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
+                        let (connection_activity_tx, new_connection_activity_rx) =
+                            mpsc::channel::<()>(1);
+                        client.reconnect(incoming_rx, outgoing_tx, cx);
+                        connection_activity_rx = new_connection_activity_rx;
+                        proxy_channels = (incoming_tx, outgoing_rx, connection_activity_tx);
+                        continue;
                     }
-                }
+
+                    let error = match status {
+                        Ok(exit_code) => anyhow!(
+                            "remote client exited before becoming ready, exit_code={exit_code}"
+                        ),
+                        Err(error) => error.context("remote client exited before becoming ready"),
+                    };
+                    log::error!("failed to establish connection: {error:#}");
+                    return Err(error);
+                };
                 let multiplex_task = Self::monitor(this.downgrade(), io_task, cx);
                 if let Err(error) = client.ping(HEARTBEAT_TIMEOUT).await {
                     log::error!("failed to establish connection: {}", error);
@@ -695,8 +716,11 @@ impl RemoteClient {
             attempts
         );
 
-        let unique_identifier = self.unique_identifier.clone();
+        let unique_identifier = self.unique_identifier.identifier.clone();
         let client = self.client.clone();
+        let reuse_connection = attempts == 1
+            && !remote_connection.has_been_killed()
+            && Arc::strong_count(&remote_connection) > 1;
         let reconnect_task = cx.spawn(async move |this, cx| {
             macro_rules! failed {
                 ($error:expr, $attempts:expr, $remote_connection:expr, $delegate:expr) => {
@@ -710,32 +734,20 @@ impl RemoteClient {
                 };
             }
 
-            if let Err(error) = remote_connection
-                .kill()
-                .await
-                .context("Failed to kill remote_connection process")
-            {
-                failed!(error, attempts, remote_connection, delegate);
-            };
-
-            let connection_options = remote_connection.connection_options();
-
             let (outgoing_tx, outgoing_rx) = mpsc::unbounded::<Envelope>();
             let (incoming_tx, incoming_rx) = mpsc::unbounded::<Envelope>();
             let (connection_activity_tx, connection_activity_rx) = mpsc::channel::<()>(1);
 
             let (remote_connection, io_task) = match async {
-                let remote_connection = cx
-                    .update_global(|pool: &mut ConnectionPool, cx| {
-                        pool.connect(
-                            connection_options,
-                            Some(remote_connection.remote_platform().os),
-                            delegate.clone(),
-                            cx,
-                        )
+                let remote_connection = if reuse_connection {
+                    remote_connection.clone()
+                } else {
+                    cx.update_global(|pool: &mut ConnectionPool, cx| {
+                        pool.connect_replacing(&remote_connection, delegate.clone(), cx)
                     })
                     .await
-                    .map_err(|error| error.cloned())?;
+                    .map_err(|error| error.cloned())?
+                };
 
                 let io_task = remote_connection.start_proxy(
                     unique_identifier,
@@ -935,7 +947,8 @@ impl RemoteClient {
                 Ok(exit_code) => {
                     if let Some(error) = ProxyLaunchError::from_exit_code(exit_code) {
                         match error {
-                            ProxyLaunchError::ServerNotRunning => {
+                            ProxyLaunchError::ServerNotRunning
+                            | ProxyLaunchError::ServerOwnedByAnotherClient => {
                                 log::error!("failed to reconnect because server is not running");
                                 this.update(cx, |this, cx| {
                                     this.set_state(State::ServerNotRunning, cx);
@@ -1286,6 +1299,26 @@ struct ConnectionPool {
 impl Global for ConnectionPool {}
 
 impl ConnectionPool {
+    fn connect_replacing(
+        &mut self,
+        replaced: &Arc<dyn RemoteConnection>,
+        delegate: Arc<dyn RemoteClientDelegate>,
+        cx: &mut App,
+    ) -> Shared<Task<Result<Arc<dyn RemoteConnection>, Arc<anyhow::Error>>>> {
+        let opts = replaced.connection_options();
+        let known_os = Some(replaced.remote_platform().os);
+        if let Some(ConnectionPoolEntry::Connected(current)) = self.connections.get(&opts)
+            && current
+                .upgrade()
+                .is_none_or(|current| Arc::ptr_eq(&current, replaced))
+        {
+            log::debug!("Replacing the failed connection with a new one");
+            self.connections.remove(&opts);
+            return self.start_connecting(opts, known_os, Some(replaced.clone()), delegate, cx);
+        }
+        self.connect(opts, known_os, delegate, cx)
+    }
+
     fn connect(
         &mut self,
         opts: RemoteConnectionOptions,
@@ -1321,12 +1354,29 @@ impl ConnectionPool {
                 log::debug!("No existing connection found, starting a new one");
             }
         }
+        self.start_connecting(opts, known_os, None, delegate, cx)
+    }
 
+    fn start_connecting(
+        &mut self,
+        opts: RemoteConnectionOptions,
+        known_os: Option<RemoteOs>,
+        retired: Option<Arc<dyn RemoteConnection>>,
+        delegate: Arc<dyn RemoteClientDelegate>,
+        cx: &mut App,
+    ) -> Shared<Task<Result<Arc<dyn RemoteConnection>, Arc<anyhow::Error>>>> {
         let task = cx
             .spawn({
                 let opts = opts.clone();
                 let delegate = delegate.clone();
                 async move |cx| {
+                    if let Some(retired) = retired {
+                        retired
+                            .kill()
+                            .await
+                            .context("Failed to kill the replaced remote connection")
+                            .log_err();
+                    }
                     let connection = match opts.clone() {
                         RemoteConnectionOptions::Ssh(opts) => {
                             SshRemoteConnection::new(opts, known_os, delegate, cx)
@@ -1379,7 +1429,7 @@ impl ConnectionPool {
             .shared();
         if let Some(task) = task.downgrade() {
             self.connections
-                .insert(opts.clone(), ConnectionPoolEntry::Connecting(task));
+                .insert(opts, ConnectionPoolEntry::Connecting(task));
         }
         task
     }
@@ -1639,24 +1689,160 @@ mod tests {
             |cx: &mut App| ServerIdentifierLease::acquire(ConnectionIdentifier::Workspace(7), cx);
         let (first, second, reacquired) = cx.update(|cx| {
             release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Stable, cx);
-            let first = workspace_identifier(cx);
-            let second = workspace_identifier(cx);
-            let identifiers = (
-                first.identifier().to_owned(),
-                second.identifier().to_owned(),
-            );
-            drop(first);
-            let reacquired = workspace_identifier(cx);
-            (
-                identifiers.0,
-                identifiers.1,
-                reacquired.identifier().to_owned(),
-            )
+            let first_lease = workspace_identifier(cx);
+            let second = workspace_identifier(cx).identifier.clone();
+            let first = first_lease.identifier.clone();
+            drop(first_lease);
+            (first, second, workspace_identifier(cx).identifier.clone())
         });
 
         assert_eq!(
-            (first.as_str(), second == first, reacquired.as_str()),
-            ("workspace-7", false, "workspace-7")
+            (
+                first.as_str(),
+                second.len(),
+                is_setup_connection_identifier(&second),
+                reacquired.as_str()
+            ),
+            ("ws-7", "conn-".len() + 8, true, "ws-7")
+        );
+        assert_eq!(
+            [
+                "preview-conn-0badf00d",
+                "conn-12",
+                "conn-",
+                "conn-xyz",
+                "bogus-conn-1",
+                "ws-7",
+                "setup-1",
+            ]
+            .map(is_setup_connection_identifier),
+            [true, true, false, false, false, false, false]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_reconnect_keeps_healthy_shared_connection(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Stable, cx)
+        });
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let ping_handler = server_cx.new(|_| ());
+        server_session.add_request_handler::<proto::Ping, _, _, _>(
+            ping_handler.downgrade(),
+            |_, _, _| async { Ok(proto::Ack {}) },
+        );
+        drop(connect_guard);
+        let client = RemoteClient::connect_mock(opts, cx).await;
+        let connection = client
+            .read_with(cx, |client, _| client.remote_connection())
+            .expect("connected client has a connection");
+
+        client.update(cx, |client, cx| client.force_heartbeat_timeout(0, cx));
+        cx.run_until_parked();
+
+        let (state, reconnected_on_old_connection) = client.read_with(cx, |client, _| {
+            (
+                client.connection_state(),
+                client
+                    .remote_connection()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &connection)),
+            )
+        });
+        assert_eq!(
+            (
+                connection.has_been_killed(),
+                reconnected_on_old_connection,
+                state
+            ),
+            (false, true, ConnectionState::Connected)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_identifier_owned_by_another_client_is_replaced_with_a_fresh_one(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            release_channel::init_test(Version::new(0, 0, 0), ReleaseChannel::Stable, cx);
+            cx.default_global::<crate::transport::mock::MockConnectionRegistry>()
+                .identifiers_owned_by_another_client
+                .insert(String::from("ws-7"));
+        });
+        let (opts, server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        let ping_handler = server_cx.new(|_| ());
+        server_session.add_request_handler::<proto::Ping, _, _, _>(
+            ping_handler.downgrade(),
+            |_, _, _| async { Ok(proto::Ack {}) },
+        );
+        drop(connect_guard);
+        let delegate = Arc::new(crate::transport::mock::MockDelegate);
+        let connection = connect(opts, delegate.clone(), &mut cx.to_async())
+            .await
+            .expect("connection");
+        let (_cancel, cancellation) = oneshot::channel();
+
+        let client = cx
+            .update(|cx| {
+                RemoteClient::new(
+                    ConnectionIdentifier::Workspace(7),
+                    connection,
+                    cancellation,
+                    delegate,
+                    cx,
+                )
+            })
+            .await
+            .expect("client connects")
+            .expect("client is not cancelled");
+
+        let (identifier, state) = client.read_with(cx, |client, _| {
+            (
+                client.unique_identifier.identifier.clone(),
+                client.connection_state(),
+            )
+        });
+        assert_eq!(
+            (is_setup_connection_identifier(&identifier), state),
+            (true, ConnectionState::Connected)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_simultaneous_reconnects_share_one_replacement_connection(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let (opts, _server_session, connect_guard) = RemoteClient::fake_server(cx, server_cx);
+        drop(connect_guard);
+        let delegate = Arc::new(crate::transport::mock::MockDelegate);
+        let old = connect(opts, delegate.clone(), &mut cx.to_async())
+            .await
+            .expect("initial connection");
+        let replace = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                cx.update_default_global(|pool: &mut ConnectionPool, cx| {
+                    pool.connect_replacing(&old, delegate.clone(), cx)
+                })
+            })
+        };
+
+        let (first, second) = (replace(cx), replace(cx));
+        let first = first.await.expect("first replacement");
+        let second = second.await.expect("second replacement");
+        let later = replace(cx).await.expect("later replacement");
+
+        assert_eq!(
+            (
+                Arc::ptr_eq(&first, &old),
+                Arc::ptr_eq(&first, &second),
+                Arc::ptr_eq(&first, &later),
+                old.has_been_killed()
+            ),
+            (false, true, true, true)
         );
     }
 
@@ -1720,6 +1906,7 @@ pub trait RemoteConnection: Send + Sync {
     ) -> Task<Result<()>>;
     async fn kill(&self) -> Result<()>;
     fn has_been_killed(&self) -> bool;
+
     fn shares_network_interface(&self) -> bool {
         false
     }

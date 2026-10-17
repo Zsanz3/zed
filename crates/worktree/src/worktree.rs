@@ -1372,7 +1372,6 @@ impl LocalWorktree {
                 };
                 let fs_case_sensitive = fs.is_case_sensitive().await;
 
-                let is_single_file = snapshot.snapshot.root_dir().is_none();
                 let mut scanner = BackgroundScanner {
                     fs,
                     fs_case_sensitive,
@@ -1398,7 +1397,6 @@ impl LocalWorktree {
                     settings,
                     watcher,
                     track_git_repositories,
-                    is_single_file,
                     defer_watch,
                 };
 
@@ -1428,7 +1426,7 @@ impl LocalWorktree {
                         }
                         ScanState::RootDeleted => {
                             log::info!(
-                                "worktree root {} no longer exists, closing worktree",
+                                "worktree root {} no longer exists, marking its files as deleted",
                                 this.abs_path().display()
                             );
                             cx.emit(Event::Deleted);
@@ -4377,9 +4375,6 @@ struct BackgroundScanner {
     settings: WorktreeSettings,
     share_private_files: bool,
     track_git_repositories: bool,
-    /// Whether this is a single-file worktree (root is a file, not a directory).
-    /// Used to determine if we should give up after repeated canonicalization failures.
-    is_single_file: bool,
     defer_watch: bool,
 }
 
@@ -4593,7 +4588,7 @@ impl BackgroundScanner {
 
         let root_path_check_timer = self.executor.timer(ROOT_PATH_CHECK_INTERVAL).fuse();
         futures::pin_mut!(root_path_check_timer);
-        let mut root_path_missing = false;
+        let mut reported_root_missing = None;
 
         loop {
             select_biased! {
@@ -4653,10 +4648,11 @@ impl BackgroundScanner {
                 _ = root_path_check_timer => {
                     let root_path = self.state.lock().await.snapshot.abs_path.clone();
                     match self.fs.canonicalize(root_path.as_path()).await {
-                        Ok(_) => root_path_missing = false,
+                        Ok(_) => reported_root_missing = None,
                         Err(error) => {
-                            if !root_path_missing {
-                                root_path_missing = true;
+                            let missing = is_missing_path_error(&error);
+                            if reported_root_missing != Some(missing) {
+                                reported_root_missing = Some(missing);
                                 self.report_root_moved_or_deleted(&root_path, &error).await;
                             }
                         }
@@ -4831,20 +4827,15 @@ impl BackgroundScanner {
             self.status_updates_tx
                 .unbounded_send(ScanState::RootUpdated { new_path })
                 .ok();
+        } else if is_missing_path_error(canonicalize_error) {
+            log::error!("root path no longer exists: {canonicalize_error:#}");
+            self.status_updates_tx
+                .unbounded_send(ScanState::RootDeleted)
+                .ok();
         } else {
-            log::error!("root path could not be canonicalized: {canonicalize_error:#}");
-
-            // For single-file worktrees, if we can't canonicalize and the file handle
-            // fallback also failed, the file is gone - close the worktree
-            if self.is_single_file {
-                log::info!(
-                    "single-file worktree root {:?} no longer exists, marking as deleted",
-                    root_path.as_path()
-                );
-                self.status_updates_tx
-                    .unbounded_send(ScanState::RootDeleted)
-                    .ok();
-            }
+            log::error!(
+                "root path is inaccessible, keeping its files as they are: {canonicalize_error:#}"
+            );
         }
     }
 
@@ -6548,6 +6539,18 @@ fn build_diff(
     changes.into()
 }
 
+fn is_missing_path_error(error: &anyhow::Error) -> bool {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            )
+        })
+}
+
 fn is_beyond_scan_depth(file_scan_depth: Option<u32>, path: &RelPath) -> bool {
     file_scan_depth.is_some_and(|depth| path.components().count() >= depth as usize)
 }
@@ -7570,7 +7573,6 @@ mod tests {
                     settings: tree.settings.clone(),
                     share_private_files: tree.share_private_files,
                     track_git_repositories: true,
-                    is_single_file: false,
                     defer_watch: false,
                 }
             });

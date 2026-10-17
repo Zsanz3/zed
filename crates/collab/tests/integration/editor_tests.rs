@@ -1,4 +1,4 @@
-use crate::TestServer;
+use crate::{TestClient, TestServer};
 use call::ActiveCall;
 use collab::rpc::RECONNECT_TIMEOUT;
 use collections::{HashMap, HashSet};
@@ -16,7 +16,8 @@ use editor::{
         expand_macro_recursively, wrap_with_abbreviation,
     },
 };
-use fs::Fs;
+use extension::ExtensionHostProxy;
+use fs::{FakeFs, Fs};
 use futures::{
     FutureExt as _, SinkExt, StreamExt,
     channel::{mpsc, oneshot},
@@ -27,16 +28,21 @@ use gpui::{
     App, AppContext as _, Entity, Rgba, SharedString, TestAppContext, UpdateGlobal, VisualContext,
     VisualTestContext,
 };
+use http_client::BlockedHttpClient;
 use indoc::indoc;
 use language::{
-    FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, language_settings::LanguageSettings,
-    rust_lang,
+    FakeLspAdapter, Language, LanguageConfig, LanguageMatcher, LanguageRegistry,
+    language_settings::LanguageSettings, rust_lang,
 };
 use lsp::DEFAULT_LSP_REQUEST_TIMEOUT;
 use multi_buffer::{AnchorRangeExt as _, MultiBufferRow};
+use node_runtime::NodeRuntime;
 use pretty_assertions::assert_eq;
 use project::{
-    ProgressToken, ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
+    ProgressToken, Project, ProjectPath, SERVER_PROGRESS_THROTTLE_TIMEOUT,
+    debugger::breakpoint_store::{
+        Breakpoint, BreakpointEditAction, BreakpointStore, BreakpointWithPosition,
+    },
     lsp_store::{
         TokenType,
         emmet_ext::LspExpandAbbreviation,
@@ -45,7 +51,9 @@ use project::{
     trusted_worktrees::{PathTrust, TrustedWorktrees},
 };
 use recent_projects::disconnected_overlay::DisconnectedOverlay;
-use rpc::{ProtoClient as _, RECEIVE_TIMEOUT};
+use remote::RemoteClient;
+use remote_server::{HeadlessAppState, HeadlessProject};
+use rpc::{ProtoClient as _, RECEIVE_TIMEOUT, proto};
 use serde_json::json;
 use settings::{
     DocumentFoldingRanges, DocumentSymbols, InlayHintSettingsContent, InlineBlameSettings,
@@ -5825,6 +5833,360 @@ async fn test_add_breakpoints(cx_a: &mut TestAppContext, cx_b: &mut TestAppConte
 
     assert_eq!(0, breakpoints_a.len());
     assert_eq!(breakpoints_a, breakpoints_b);
+
+    let breakpoint_files = |editor: &Entity<Editor>, cx: &mut VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor
+                .breakpoint_store()
+                .unwrap()
+                .read(cx)
+                .all_source_breakpoints(cx)
+                .len()
+        })
+    };
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.toggle_breakpoint(&editor::actions::ToggleBreakpoint, window, cx);
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.move_up(&zed_actions::editor::MoveUp, window, cx);
+        editor.move_up(&zed_actions::editor::MoveUp, window, cx);
+        editor.toggle_breakpoint(&editor::actions::ToggleBreakpoint, window, cx);
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    let after_host_removed_the_last_one = (
+        breakpoint_files(&editor_a, cx_a),
+        breakpoint_files(&editor_b, cx_b),
+    );
+
+    editor_b.update_in(cx_b, |editor, window, cx| {
+        editor.toggle_breakpoint(&editor::actions::ToggleBreakpoint, window, cx);
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    editor_b.update(cx_b, |editor, cx| {
+        editor
+            .breakpoint_store()
+            .unwrap()
+            .update(cx, |store, cx| store.clear_breakpoints(cx))
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    let after_guest_cleared_all = (
+        breakpoint_files(&editor_a, cx_a),
+        breakpoint_files(&editor_b, cx_b),
+    );
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.toggle_breakpoint(&editor::actions::ToggleBreakpoint, window, cx);
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    let before_concurrent_clears = (
+        breakpoint_files(&editor_a, cx_a),
+        breakpoint_files(&editor_b, cx_b),
+    );
+    for (editor, cx) in [(&editor_a, &mut *cx_a), (&editor_b, &mut *cx_b)] {
+        editor.update(cx, |editor, cx| {
+            editor
+                .breakpoint_store()
+                .unwrap()
+                .update(cx, |store, cx| store.clear_breakpoints(cx))
+        });
+    }
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+    let after_concurrent_clears = (
+        breakpoint_files(&editor_a, cx_a),
+        breakpoint_files(&editor_b, cx_b),
+    );
+
+    assert_eq!(
+        (
+            after_host_removed_the_last_one,
+            after_guest_cleared_all,
+            before_concurrent_clears,
+            after_concurrent_clears
+        ),
+        ((0, 0), (0, 0), (1, 1), (0, 0))
+    );
+}
+
+#[gpui::test]
+async fn test_guest_loading_a_buffer_keeps_host_cleared_breakpoints_cleared(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let executor = cx_a.executor();
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    cx_a.update(editor::init);
+    cx_b.update(editor::init);
+    client_a
+        .fs()
+        .insert_tree("/a", json!({ "test.txt": "one\ntwo" }))
+        .await;
+    let (project_a, worktree_id) = client_a.build_local_project("/a", cx_a).await;
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    let (workspace_a, cx_a) = client_a.build_workspace(&project_a, cx_a);
+    let editor_a = workspace_a
+        .update_in(cx_a, |workspace, window, cx| {
+            workspace.open_path(
+                ProjectPath {
+                    worktree_id,
+                    path: rel_path("test.txt").into(),
+                },
+                None,
+                true,
+                window,
+                cx,
+            )
+        })
+        .await
+        .unwrap()
+        .downcast::<Editor>()
+        .unwrap();
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    editor_a.update_in(cx_a, |editor, window, cx| {
+        editor.toggle_breakpoint(&editor::actions::ToggleBreakpoint, window, cx);
+        editor
+            .breakpoint_store()
+            .unwrap()
+            .update(cx, |store, cx| store.clear_breakpoints(cx));
+    });
+    cx_a.run_until_parked();
+    cx_b.run_until_parked();
+
+    let guest_breakpoints = project_b.update(cx_b, |project, cx| {
+        project
+            .breakpoint_store()
+            .read(cx)
+            .all_source_breakpoints(cx)
+            .len()
+    });
+    assert_eq!(guest_breakpoints, 0);
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_host_applies_guest_breakpoint_edits_in_order_once_anchors_arrive(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let executor = cx_a.executor();
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let (project_a, project_b, buffer_b, project_id) =
+        share_buffer_with_guest(&client_a, &client_b, cx_a, cx_b).await;
+
+    let unseen_position = unseen_insertion_anchor(&buffer_b, cx_b);
+    let set_request = request_breakpoint_edit(
+        &client_b,
+        project_id,
+        unseen_position,
+        proto::BreakpointEdit::Set,
+        cx_b,
+    );
+    executor.run_until_parked();
+    let remove_request = request_breakpoint_edit(
+        &client_b,
+        project_id,
+        unseen_position,
+        proto::BreakpointEdit::Remove,
+        cx_b,
+    );
+    executor.run_until_parked();
+    let pending_before_edit = pending_remote_edits(&project_a, cx_a);
+
+    let inserted_row_start = buffer_b.update(cx_b, |buffer, cx| {
+        buffer.edit([(Point::new(1, 3)..Point::new(1, 3), "\nthree")], None, cx);
+        buffer.end_transaction(cx);
+        buffer.anchor_after(Point::new(2, 0))
+    });
+    executor.run_until_parked();
+
+    assert_eq!(
+        (
+            inserted_row_start,
+            pending_before_edit,
+            set_request
+                .now_or_never()
+                .map(|response| response.map_err(|error| error.to_string())),
+            remove_request
+                .now_or_never()
+                .map(|response| response.map_err(|error| error.to_string())),
+            pending_remote_edits(&project_a, cx_a),
+            project_a.read_with(cx_a, |project, cx| breakpoint_rows(
+                project.breakpoint_store().read(cx),
+                cx
+            )),
+            project_b.read_with(cx_b, |project, cx| breakpoint_rows(
+                project.breakpoint_store().read(cx),
+                cx
+            )),
+        ),
+        (
+            unseen_position,
+            (2, 1),
+            Some(Ok(proto::Ack {})),
+            Some(Ok(proto::Ack {})),
+            (0, 0),
+            Vec::new(),
+            Vec::new()
+        )
+    );
+}
+
+#[gpui::test(iterations = 10)]
+async fn test_host_cancels_pending_breakpoint_edits_of_departed_guest(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) {
+    let executor = cx_a.executor();
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+    let (project_a, project_b, buffer_b, project_id) =
+        share_buffer_with_guest(&client_a, &client_b, cx_a, cx_b).await;
+
+    let unseen_position = unseen_insertion_anchor(&buffer_b, cx_b);
+    let set_request = request_breakpoint_edit(
+        &client_b,
+        project_id,
+        unseen_position,
+        proto::BreakpointEdit::Set,
+        cx_b,
+    );
+    executor.run_until_parked();
+    let pending_before_leaving = pending_remote_edits(&project_a, cx_a);
+    cx_b.update(|_| drop((project_b, buffer_b)));
+    executor.run_until_parked();
+
+    assert_eq!(
+        (
+            pending_before_leaving,
+            project_a.read_with(cx_a, |project, _| project.is_shared()),
+            pending_remote_edits(&project_a, cx_a),
+            set_request
+                .now_or_never()
+                .map(|response| response.map_err(|error| error.to_string())),
+        ),
+        (
+            (1, 1),
+            true,
+            (0, 0),
+            Some(Err(String::from(
+                "RPC request ToggleBreakpoint failed: Breakpoint edit was cancelled: oneshot canceled"
+            )))
+        )
+    );
+}
+
+#[gpui::test]
+async fn test_guest_breakpoints_reach_ssh_host_upstream(
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let executor = cx_a.executor();
+    cx_a.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let mut server = TestServer::start(executor.clone()).await;
+    let client_a = server.create_client(cx_a, "user_a").await;
+    let client_b = server.create_client(cx_b, "user_b").await;
+    server
+        .create_room(&mut [(&client_a, cx_a), (&client_b, cx_b)])
+        .await;
+
+    let (opts, server_ssh, _) = RemoteClient::fake_server(cx_a, server_cx);
+    let remote_fs = FakeFs::new(server_cx.executor());
+    remote_fs
+        .insert_tree(path!("/code"), json!({ "test.txt": "one\ntwo\nthree" }))
+        .await;
+    server_cx.update(HeadlessProject::init);
+    let languages = Arc::new(LanguageRegistry::new(server_cx.executor()));
+    let headless_project = server_cx.new(|cx| {
+        HeadlessProject::new(
+            HeadlessAppState {
+                session: server_ssh,
+                fs: remote_fs.clone(),
+                http_client: Arc::new(BlockedHttpClient),
+                node_runtime: NodeRuntime::unavailable(),
+                languages,
+                extension_host_proxy: Arc::new(ExtensionHostProxy::new()),
+                startup_time: std::time::Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+    let client_ssh = RemoteClient::connect_mock(opts, cx_a).await;
+    let (project_a, worktree_id) = client_a
+        .build_ssh_project(path!("/code"), client_ssh, false, cx_a)
+        .await;
+    let active_call_a = cx_a.read(ActiveCall::global);
+    let project_id = active_call_a
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    executor.run_until_parked();
+    let buffer_a = project_a
+        .update(cx_a, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("test.txt")), cx)
+        })
+        .await
+        .unwrap();
+    let buffer_b = project_b
+        .update(cx_b, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("test.txt")), cx)
+        })
+        .await
+        .unwrap();
+    executor.run_until_parked();
+
+    toggle_breakpoint_at_row(&project_b, &buffer_b, 1, cx_b);
+    executor.run_until_parked();
+    toggle_breakpoint_at_row(&project_a, &buffer_a, 2, cx_a);
+    executor.run_until_parked();
+
+    assert_eq!(
+        (
+            headless_project.read_with(server_cx, |project, cx| breakpoint_rows(
+                project.breakpoint_store.read(cx),
+                cx
+            )),
+            project_a.read_with(cx_a, |project, cx| breakpoint_rows(
+                project.breakpoint_store().read(cx),
+                cx
+            )),
+            project_b.read_with(cx_b, |project, cx| breakpoint_rows(
+                project.breakpoint_store().read(cx),
+                cx
+            )),
+        ),
+        (Vec::from([1, 2]), Vec::from([1, 2]), Vec::from([1, 2]))
+    );
 }
 
 #[gpui::test]
@@ -7756,4 +8118,114 @@ async fn run_guest_semantic_tokens_document_selector_test(
         expected_token_type,
         "expected the guest to decode tokens only when the applicable provider's legend is known",
     );
+}
+
+fn breakpoint_rows(breakpoint_store: &BreakpointStore, cx: &App) -> Vec<u32> {
+    let mut rows = breakpoint_store
+        .all_source_breakpoints(cx)
+        .into_values()
+        .flatten()
+        .map(|breakpoint| breakpoint.row)
+        .collect::<Vec<_>>();
+    rows.sort_unstable();
+    rows
+}
+
+async fn share_buffer_with_guest(
+    client_a: &TestClient,
+    client_b: &TestClient,
+    cx_a: &mut TestAppContext,
+    cx_b: &mut TestAppContext,
+) -> (
+    Entity<Project>,
+    Entity<Project>,
+    Entity<language::Buffer>,
+    u64,
+) {
+    client_a
+        .fs()
+        .insert_tree(path!("/a"), json!({ "test.txt": "one\ntwo" }))
+        .await;
+    let (project_a, worktree_id) = client_a.build_local_project(path!("/a"), cx_a).await;
+    let project_id = cx_a
+        .read(ActiveCall::global)
+        .update(cx_a, |call, cx| call.share_project(project_a.clone(), cx))
+        .await
+        .unwrap();
+    let project_b = client_b.join_remote_project(project_id, cx_b).await;
+    let buffer_b = project_b
+        .update(cx_b, |project, cx| {
+            project.open_buffer((worktree_id, rel_path("test.txt")), cx)
+        })
+        .await
+        .unwrap();
+    cx_a.executor().run_until_parked();
+    (project_a, project_b, buffer_b, project_id)
+}
+
+fn unseen_insertion_anchor(
+    buffer: &Entity<language::Buffer>,
+    cx: &mut TestAppContext,
+) -> text::Anchor {
+    buffer.update(cx, |buffer, _| {
+        buffer.start_transaction();
+        text::Anchor::new(
+            buffer.lamport_clock,
+            1,
+            text::Bias::Right,
+            buffer.remote_id(),
+        )
+    })
+}
+
+fn request_breakpoint_edit(
+    client: &TestClient,
+    project_id: u64,
+    position: text::Anchor,
+    edit: proto::BreakpointEdit,
+    cx: &mut TestAppContext,
+) -> gpui::Task<anyhow::Result<proto::Ack>> {
+    cx.background_spawn(client.client().request(proto::ToggleBreakpoint {
+        project_id,
+        path: path!("/a/test.txt").to_owned(),
+        breakpoint: Some(proto::Breakpoint {
+            position: Some(language::proto::serialize_anchor(&position)),
+            state: i32::from(proto::BreakpointState::Enabled),
+            message: None,
+            condition: None,
+            hit_condition: None,
+            session_state: std::collections::HashMap::default(),
+        }),
+        edit: i32::from(edit),
+    }))
+}
+
+fn pending_remote_edits(project: &Entity<Project>, cx: &mut TestAppContext) -> (usize, usize) {
+    project.read_with(cx, |project, cx| {
+        project.breakpoint_store().read(cx).pending_remote_edits()
+    })
+}
+
+fn toggle_breakpoint_at_row(
+    project: &Entity<Project>,
+    buffer: &Entity<language::Buffer>,
+    row: u32,
+    cx: &mut TestAppContext,
+) {
+    project.update(cx, |project, cx| {
+        let position = buffer.read(cx).anchor_before(Point::new(row, 0));
+        project
+            .breakpoint_store()
+            .update(cx, |breakpoint_store, cx| {
+                breakpoint_store.toggle_breakpoint(
+                    buffer.clone(),
+                    BreakpointWithPosition {
+                        position,
+                        bp: Breakpoint::new_standard(),
+                    },
+                    BreakpointEditAction::Toggle,
+                    cx,
+                )
+            });
+    });
 }

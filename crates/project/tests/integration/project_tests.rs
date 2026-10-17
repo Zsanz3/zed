@@ -8804,6 +8804,49 @@ async fn test_edit_buffer_while_it_reloads(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_reload_keeps_edits_made_while_reading_the_file(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree(path!("/dir"), json!({ "file1": "the original contents" }))
+        .await;
+    let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |p, cx| p.open_local_buffer(path!("/dir/file1"), cx))
+        .await
+        .unwrap();
+
+    fs.save(
+        path!("/dir/file1").as_ref(),
+        &"the first contents".into(),
+        LineEnding::default(),
+    )
+    .await
+    .unwrap();
+    let reload = buffer.update(cx, |buffer, cx| {
+        let reload = buffer.reload(cx);
+        buffer.edit([(0..0, "live ")], None, cx);
+        reload
+    });
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        (
+            reload.now_or_never().map(|transaction| transaction.is_ok()),
+            buffer.read_with(cx, |buffer, _| (
+                buffer.text(),
+                buffer.is_dirty(),
+                buffer.has_conflict()
+            )),
+        ),
+        (
+            Some(false),
+            ("live the original contents".to_string(), true, true)
+        )
+    );
+}
+
+#[gpui::test]
 async fn test_save_in_single_file_worktree(cx: &mut gpui::TestAppContext) {
     init_test(cx);
 

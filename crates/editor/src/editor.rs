@@ -272,7 +272,7 @@ use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemNavHistory, NavigationEntry, OpenInTerminal,
     OpenTerminal, Pane, RestoreOnStartupBehavior, SERIALIZATION_THROTTLE_TIME, SplitDirection,
     TabBarSettings, Toast, ViewId, Workspace, WorkspaceId, WorkspaceSettings,
-    item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions},
+    item::{ItemBufferKind, ItemHandle, PreviewTabsSettings, SaveOptions, SerializableItem},
     notifications::{DetachAndPromptErr, NotificationId, NotifyResultExt, NotifyTaskExt},
     searchable::{SearchEvent, SelectSearchOptions},
 };
@@ -355,6 +355,10 @@ impl Navigated {
     pub fn from_bool(yes: bool) -> Navigated {
         if yes { Navigated::Yes } else { Navigated::No }
     }
+}
+
+pub fn workspaces_with_unsaved_contents(cx: &App) -> Result<Vec<WorkspaceId>> {
+    EditorDb::global(cx).workspaces_with_unsaved_contents(Editor::serialized_item_kind())
 }
 
 pub fn init(cx: &mut App) {

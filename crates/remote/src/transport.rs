@@ -1,21 +1,34 @@
-use std::{
-    io::Write,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::io::Write;
 
 use crate::{
     RemoteArch, RemoteOs, RemotePlatform,
     json_log::LogRecord,
     protocol::{MESSAGE_LEN_SIZE, message_len_from_buffer, read_message_with_len, write_message},
+    proxy::ProxyLaunchError,
 };
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use futures::{
     AsyncReadExt as _, FutureExt as _, StreamExt as _,
-    channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
+    channel::{
+        mpsc::{Sender, UnboundedReceiver, UnboundedSender},
+        oneshot,
+    },
+    future::{self, Either},
 };
 use gpui::{AppContext as _, AsyncApp, Task};
+use parking_lot::Mutex;
 use rpc::proto::Envelope;
-use util::command::Child;
+use std::{
+    path::Path,
+    sync::{
+        OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
+};
+use util::{
+    command::Child,
+    rel_path::{RelPath, RelPathBuf},
+};
 
 pub mod docker;
 #[cfg(any(test, feature = "test-support"))]
@@ -148,6 +161,180 @@ fn parse_home_dir(output: &str) -> Option<String> {
     (home_dir.starts_with('/') && !home_dir.contains('\u{FFFD}')).then(|| home_dir.to_owned())
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ProxyProcesses {
+    killed: AtomicBool,
+    cancellations: Mutex<Vec<oneshot::Sender<()>>>,
+}
+
+impl ProxyProcesses {
+    pub(crate) fn run(
+        &self,
+        proxy_process: Child,
+        incoming_tx: UnboundedSender<Envelope>,
+        outgoing_rx: UnboundedReceiver<Envelope>,
+        connection_activity_tx: Sender<()>,
+        cx: &AsyncApp,
+    ) -> Task<Result<i32>> {
+        let Some(cancelled) = self.register() else {
+            return Task::ready(Err(anyhow!("Remote connection was killed")));
+        };
+        let proxy = handle_rpc_messages_over_child_process_stdio(
+            proxy_process,
+            incoming_tx,
+            outgoing_rx,
+            connection_activity_tx,
+            cx,
+        );
+        let killed = async move {
+            if cancelled.await.is_err() {
+                future::pending::<()>().await;
+            }
+        };
+        cx.background_spawn(async move {
+            match future::select(proxy, Box::pin(killed)).await {
+                Either::Left((status, _)) => status,
+                Either::Right(_) => Err(anyhow!("Remote server proxy was killed")),
+            }
+        })
+    }
+
+    pub(crate) fn kill(&self) {
+        self.killed.store(true, Ordering::Release);
+        for cancellation in self.cancellations.lock().drain(..) {
+            cancellation.send(()).ok();
+        }
+    }
+
+    pub(crate) fn has_been_killed(&self) -> bool {
+        self.killed.load(Ordering::Acquire)
+    }
+
+    fn register(&self) -> Option<oneshot::Receiver<()>> {
+        let mut cancellations = self.cancellations.lock();
+        if self.has_been_killed() {
+            return None;
+        }
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        cancellations.retain(|cancellation| !cancellation.is_canceled());
+        cancellations.push(cancel_tx);
+        Some(cancel_rx)
+    }
+}
+
+pub(crate) fn proxy_arguments(unique_identifier: String, reconnect: bool) -> Vec<String> {
+    let mut arguments = Vec::from([
+        String::from("proxy"),
+        String::from("--identifier"),
+        unique_identifier,
+        String::from("--owner"),
+        String::from(server_owner()),
+    ]);
+    if reconnect {
+        arguments.push(String::from("--reconnect"));
+    }
+    arguments
+}
+
+const SERVER_OWNER_FILE_NAME: &str = "remote_server_owner";
+const SERVER_OWNER_LOCK_FILE_NAME: &str = "remote_server_owner.lock";
+
+struct ServerOwner {
+    token: String,
+    _lock: Option<std::fs::File>,
+}
+
+fn server_owner() -> &'static str {
+    static SERVER_OWNER: OnceLock<ServerOwner> = OnceLock::new();
+    &SERVER_OWNER
+        .get_or_init(|| resolve_server_owner(paths::data_dir()))
+        .token
+}
+
+fn resolve_server_owner(data_dir: &Path) -> ServerOwner {
+    let installation_token = load_or_create_server_owner(&data_dir.join(SERVER_OWNER_FILE_NAME))
+        .unwrap_or_else(|error| {
+            log::error!("failed to persist the remote server owner token: {error:#}");
+            new_server_owner()
+        });
+    match lock_server_owner(&data_dir.join(SERVER_OWNER_LOCK_FILE_NAME)) {
+        Ok(Some(lock)) => ServerOwner {
+            token: installation_token,
+            _lock: Some(lock),
+        },
+        result => {
+            if let Err(error) = result {
+                log::error!("failed to lock the remote server owner token: {error:#}");
+            } else {
+                log::info!(
+                    "another process uses this data directory, using a process-specific remote server owner"
+                );
+            }
+            ServerOwner {
+                token: format!("{installation_token}-{}", new_server_owner()),
+                _lock: None,
+            }
+        }
+    }
+}
+
+fn lock_server_owner(path: &Path) -> Result<Option<std::fs::File>> {
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("creating directory {directory:?}"))?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {path:?}"))?;
+    match lock.try_lock() {
+        Ok(()) => Ok(Some(lock)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("locking {path:?}"))
+        }
+    }
+}
+
+fn load_or_create_server_owner(path: &Path) -> Result<String> {
+    if path.exists() {
+        return read_server_owner(path);
+    }
+    let directory = path
+        .parent()
+        .with_context(|| format!("{path:?} has no parent directory"))?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("creating directory {directory:?}"))?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)
+        .with_context(|| format!("creating a temporary file in {directory:?}"))?;
+    let owner = new_server_owner();
+    file.write_all(owner.as_bytes())
+        .context("writing the remote server owner token")?;
+    match file.persist_noclobber(path) {
+        Ok(_) => Ok(owner),
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            read_server_owner(path)
+        }
+        Err(error) => Err(error.error).with_context(|| format!("persisting {path:?}")),
+    }
+}
+
+fn read_server_owner(path: &Path) -> Result<String> {
+    let owner = std::fs::read_to_string(path).with_context(|| format!("reading {path:?}"))?;
+    let owner = owner.trim();
+    anyhow::ensure!(
+        owner.len() == 32 && owner.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{path:?} does not contain a valid remote server owner token"
+    );
+    Ok(owner.to_owned())
+}
+
+fn new_server_owner() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 fn handle_rpc_messages_over_child_process_stdio(
     mut remote_proxy_process: Child,
     incoming_tx: UnboundedSender<Envelope>,
@@ -254,11 +441,16 @@ fn handle_rpc_messages_over_child_process_stdio(
             let status = 1;
             status
         });
-        match result {
-            Ok(_) => Ok(status),
-            Err(error) => Err(error),
-        }
+        proxy_result(result, status)
     })
+}
+
+fn proxy_result(stream_result: Result<()>, exit_status: i32) -> Result<i32> {
+    match stream_result {
+        Ok(()) => Ok(exit_status),
+        Err(_) if ProxyLaunchError::from_exit_code(exit_status).is_some() => Ok(exit_status),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(any(debug_assertions, feature = "build-remote-server-binary"))]
@@ -546,19 +738,99 @@ async fn which(
     }
 }
 
-static NEXT_STAGING_FILE_ID: AtomicU64 = AtomicU64::new(0);
+const STAGING_FILE_MARKER: &str = "-download-";
 
-fn staging_file_suffix() -> String {
-    format!(
-        "{}-{}",
-        std::process::id(),
-        NEXT_STAGING_FILE_ID.fetch_add(1, Ordering::Relaxed)
-    )
+pub fn is_remote_server_staging_file(file_name: &str) -> bool {
+    file_name.contains(STAGING_FILE_MARKER)
+}
+
+fn staging_file_path(binary_name: &str, suffix: &str) -> Result<RelPathBuf> {
+    let uuid = uuid::Uuid::new_v4().simple();
+    let file_name = format!("{binary_name}{STAGING_FILE_MARKER}{uuid}{suffix}");
+    Ok(paths::remote_server_dir_relative().join(RelPath::from_unix_str(&file_name)?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_concurrent_processes_sharing_a_data_directory_get_distinct_server_owners() {
+        let directory = tempfile::tempdir().expect("create temp dir");
+        let first = resolve_server_owner(directory.path());
+        let concurrent = resolve_server_owner(directory.path());
+        let first_token = first.token.clone();
+        drop(first);
+        let after_first_exits = resolve_server_owner(directory.path());
+
+        assert_eq!(
+            (
+                concurrent.token.starts_with(&format!("{first_token}-")),
+                after_first_exits.token == first_token,
+            ),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn test_killing_proxy_processes_stops_running_ones_and_refuses_new_ones() {
+        let proxies = ProxyProcesses::default();
+        let mut running = (0..2)
+            .map(|_| proxies.register().unwrap())
+            .collect::<Vec<_>>();
+
+        proxies.kill();
+
+        let cancelled = running
+            .iter_mut()
+            .map(|proxy| proxy.try_recv().ok().flatten())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            (
+                cancelled,
+                proxies.has_been_killed(),
+                proxies.register().is_none()
+            ),
+            (vec![Some(()), Some(())], true, true)
+        );
+    }
+
+    #[test]
+    fn test_proxy_launch_errors_take_precedence_over_stream_errors() {
+        let launch_error = ProxyLaunchError::ServerOwnedByAnotherClient.to_exit_code();
+        let broken_pipe = || {
+            Err(anyhow::Error::from(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            )))
+        };
+        assert_eq!(
+            [
+                proxy_result(broken_pipe(), launch_error).ok(),
+                proxy_result(broken_pipe(), 1).ok(),
+                proxy_result(Ok(()), 1).ok(),
+            ],
+            [Some(launch_error), None, Some(1)]
+        );
+    }
+
+    #[test]
+    fn test_server_owner_is_created_once_and_reused() {
+        let directory = tempfile::tempdir().expect("create temp dir");
+        let path = directory.path().join("data").join(SERVER_OWNER_FILE_NAME);
+        let created = load_or_create_server_owner(&path).expect("create owner");
+        let reloaded = load_or_create_server_owner(&path).expect("reload owner");
+        std::fs::write(&path, "not a token").expect("corrupt owner");
+
+        assert_eq!(
+            (
+                created.len(),
+                created.bytes().all(|byte| byte.is_ascii_hexdigit()),
+                reloaded.as_str(),
+                load_or_create_server_owner(&path).is_err()
+            ),
+            (32, true, created.as_str(), true)
+        );
+    }
 
     #[test]
     fn test_parse_platform() {

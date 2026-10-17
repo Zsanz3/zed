@@ -5,17 +5,20 @@ use gpui::{AppContext as _, AsyncWindowContext, Axis, Entity, Task, WeakEntity};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use ui::{App, Context, Window};
+use ui::{App, Context, SharedString, Window};
 use util::ResultExt as _;
 
 use db::{
     query,
-    sqlez::{domain::Domain, statement::Statement, thread_safe_connection::ThreadSafeConnection},
+    sqlez::{
+        connection::Connection, domain::Domain, statement::Statement,
+        thread_safe_connection::ThreadSafeConnection,
+    },
     sqlez_macros::sql,
 };
 use workspace::{
     ItemId, Member, Pane, PaneAxis, PaneGroup, SerializableItem as _, SplitDirection, Workspace,
-    WorkspaceDb, WorkspaceId,
+    WorkspaceDb, WorkspaceId, item::ItemHandle, unrestored_item_view::UnrestoredItemView,
 };
 
 use crate::{
@@ -56,20 +59,28 @@ fn build_serialized_pane_group(
     }
 }
 
+pub(crate) fn persisted_terminal_item_id(item: &dyn ItemHandle, cx: &mut App) -> Option<ItemId> {
+    if let Some(terminal_view) = item.act_as::<TerminalView>(cx) {
+        let is_task = terminal_view.read(cx).terminal().read(cx).task().is_some();
+        return (!is_task).then(|| workspace::persistent_item_id(&terminal_view, cx));
+    }
+    let unrestored = item.downcast::<UnrestoredItemView>()?;
+    let unrestored = unrestored.read(cx);
+    (unrestored.kind() == TerminalView::serialized_item_kind()).then(|| unrestored.item_id())
+}
+
 fn serialize_pane(pane: &Entity<Pane>, active: bool, cx: &mut App) -> SerializedPane {
     let pane = pane.read(cx);
     let active_item_id = pane.active_item().map(|item| item.item_id());
     let pinned_count = pane.pinned_count();
-    let terminal_views = pane
-        .items()
-        .filter_map(|item| item.act_as::<TerminalView>(cx))
-        .filter(|terminal_view| terminal_view.read(cx).terminal().read(cx).task().is_none())
-        .collect::<Vec<_>>();
-    let mut children = Vec::with_capacity(terminal_views.len());
+    let items = pane.items().cloned().collect::<Vec<_>>();
+    let mut children = Vec::with_capacity(items.len());
     let mut active_item = None;
-    for terminal_view in terminal_views {
-        let item_id = workspace::persistent_item_id(&terminal_view, cx);
-        if Some(terminal_view.entity_id()) == active_item_id {
+    for item in items {
+        let Some(item_id) = persisted_terminal_item_id(item.as_ref(), cx) else {
+            continue;
+        };
+        if Some(item.item_id()) == active_item_id {
             active_item = Some(item_id);
         }
         children.push(item_id);
@@ -105,6 +116,7 @@ pub(crate) fn deserialize_terminal_panel(
                 let restored_items = items.len();
                 let active_item = serialized_panel.active_item_id;
                 terminal_panel.update_in(cx, |terminal_panel, window, cx| {
+                    terminal_panel.mark_restoring_layout_installed();
                     terminal_panel.active_pane.update(cx, |pane, cx| {
                         populate_pane_items(pane, items, active_item, window, cx);
                     });
@@ -134,6 +146,7 @@ pub(crate) fn deserialize_terminal_panel(
                             .iter()
                             .find(|pane| pane.read(cx).has_focus(window, cx))
                             .cloned();
+                        terminal_panel.mark_restoring_layout_installed();
                         terminal_panel.center = PaneGroup::with_root(center_group);
                         terminal_panel.active_pane =
                             active_pane.unwrap_or_else(|| terminal_panel.center.first_pane());
@@ -169,7 +182,7 @@ pub(crate) fn deserialize_terminal_panel(
 
 fn populate_pane_items(
     pane: &mut Pane,
-    items: Vec<(ItemId, Entity<TerminalView>)>,
+    items: Vec<(ItemId, Box<dyn ItemHandle>)>,
     active_item: Option<ItemId>,
     window: &mut Window,
     cx: &mut Context<Pane>,
@@ -180,7 +193,7 @@ fn populate_pane_items(
         if Some(saved_item_id) == active_item {
             active_item_index = Some(item_index);
         }
-        pane.add_item(Box::new(item), false, false, None, window, cx);
+        pane.add_item(item, false, false, None, window, cx);
     }
     if let Some(interim_active_item) = interim_active_item {
         if let Some(index) = pane.index_for_item(interim_active_item.as_ref()) {
@@ -314,12 +327,12 @@ fn deserialize_terminal_views(
     workspace: WeakEntity<Workspace>,
     item_ids: &[u64],
     cx: &mut AsyncWindowContext,
-) -> impl Future<Output = Vec<(ItemId, Entity<TerminalView>)>> + use<> {
+) -> impl Future<Output = Vec<(ItemId, Box<dyn ItemHandle>)>> + use<> {
     let deserialized_items = join_all(item_ids.iter().filter_map(|item_id| {
         let item_id = *item_id;
         let item = cx
             .update(|window, cx| {
-                TerminalView::deserialize(
+                workspace::deserialize_persistent_item::<TerminalView>(
                     project.clone(),
                     workspace.clone(),
                     workspace_id,
@@ -329,19 +342,71 @@ fn deserialize_terminal_views(
                 )
             })
             .ok()?;
-        Some(async move { Some((item_id, item.await.log_err()?)) })
+        let workspace = workspace.clone();
+        let mut cx = cx.clone();
+        Some(async move {
+            match item.await {
+                Ok(terminal_view) => {
+                    Some((item_id, Box::new(terminal_view) as Box<dyn ItemHandle>))
+                }
+                Err(error) => {
+                    log::error!("Failed to restore terminal {item_id}: {error:#}");
+                    let unrestored = cx
+                        .update(|_, cx| {
+                            cx.new(|cx| {
+                                UnrestoredItemView::new(
+                                    SharedString::new_static(TerminalView::serialized_item_kind()),
+                                    item_id,
+                                    workspace_id,
+                                    workspace,
+                                    &error,
+                                    cx,
+                                )
+                            })
+                        })
+                        .ok()?;
+                    Some((item_id, Box::new(unrestored) as Box<dyn ItemHandle>))
+                }
+            }
+        })
     }));
     async move { deserialized_items.await.into_iter().flatten().collect() }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+pub(crate) fn with_interim_panes(
+    restoring: &SerializedTerminalPanel,
+    interim: SerializedPaneGroup,
+) -> SerializedItems {
+    let mut restored = match &restoring.items {
+        SerializedItems::NoSplits(item_ids) => SerializedPaneGroup::Pane(SerializedPane {
+            active: true,
+            children: item_ids.clone(),
+            active_item: restoring
+                .active_item_id
+                .filter(|active_item| item_ids.contains(active_item)),
+            pinned_count: 0,
+        }),
+        SerializedItems::WithSplits(pane_group) => pane_group.clone(),
+    };
+    let Some(interim) = interim.without_empty_panes() else {
+        return SerializedItems::WithSplits(restored);
+    };
+    restored.deactivate();
+    SerializedItems::WithSplits(SerializedPaneGroup::Group {
+        axis: SerializedAxis(Axis::Horizontal),
+        flexes: None,
+        children: vec![restored, interim],
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SerializedTerminalPanel {
     pub items: SerializedItems,
     // A deprecated field, kept for backwards compatibility for the code before terminal splits were introduced.
     pub active_item_id: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub(crate) enum SerializedItems {
     // The data stored before terminal splits were introduced.
@@ -349,7 +414,79 @@ pub(crate) enum SerializedItems {
     WithSplits(SerializedPaneGroup),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+impl SerializedItems {
+    pub(crate) fn item_ids(&self) -> Vec<ItemId> {
+        match self {
+            Self::NoSplits(item_ids) => item_ids.clone(),
+            Self::WithSplits(pane_group) => pane_group.item_ids(),
+        }
+    }
+}
+
+impl SerializedPaneGroup {
+    fn item_ids(&self) -> Vec<ItemId> {
+        match self {
+            Self::Pane(pane) => pane.children.clone(),
+            Self::Group { children, .. } => children
+                .iter()
+                .flat_map(SerializedPaneGroup::item_ids)
+                .collect(),
+        }
+    }
+
+    fn without_empty_panes(self) -> Option<Self> {
+        match self {
+            Self::Pane(pane) => (!pane.children.is_empty()).then_some(Self::Pane(pane)),
+            Self::Group {
+                axis,
+                flexes,
+                children,
+            } => {
+                let child_count = children.len();
+                let mut children = children
+                    .into_iter()
+                    .filter_map(SerializedPaneGroup::without_empty_panes)
+                    .collect::<Vec<_>>();
+                match children.len() {
+                    0 => None,
+                    1 => children.pop(),
+                    kept => Some(Self::Group {
+                        axis,
+                        flexes: flexes.filter(|_| kept == child_count),
+                        children,
+                    }),
+                }
+            }
+        }
+    }
+
+    fn deactivate(&mut self) {
+        match self {
+            Self::Pane(pane) => pane.active = false,
+            Self::Group { children, .. } => children
+                .iter_mut()
+                .for_each(SerializedPaneGroup::deactivate),
+        }
+    }
+}
+
+pub(crate) fn persisted_panel_item_ids(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+) -> Result<Vec<ItemId>> {
+    let key = TerminalPanel::database_serialization_key(workspace_id);
+    let Some(serialized_panel) = db::kvp::read_value(conn, &key)? else {
+        return Ok(Vec::new());
+    };
+    Ok(
+        serde_json::from_str::<SerializedTerminalPanel>(&serialized_panel)
+            .log_err()
+            .map(|serialized_panel| serialized_panel.items.item_ids())
+            .unwrap_or_default(),
+    )
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum SerializedPaneGroup {
     Pane(SerializedPane),
     Group {
@@ -359,7 +496,7 @@ pub(crate) enum SerializedPaneGroup {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SerializedPane {
     pub active: bool,
     pub children: Vec<u64>,
@@ -368,7 +505,7 @@ pub(crate) struct SerializedPane {
     pub pinned_count: usize,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct SerializedAxis(pub Axis);
 
 impl Serialize for SerializedAxis {
